@@ -24,9 +24,6 @@ Author: Zager-Zhang
 """
 
 # Standard library imports
-import argparse
-import gzip
-import json
 import os
 import signal
 import time
@@ -61,7 +58,7 @@ from habitat.utils.visualizations.utils import (
 )
 
 # ROS message imports
-from plan_env.msg import MultipleMasksWithConfidence
+from plan_env.msg import MultipleMasksWithConfidence, SemanticScore
 
 # Local project imports
 from basic_utils.failure_check.count_files import count_files_in_directory
@@ -74,8 +71,8 @@ from basic_utils.record_episode.write_record import write_record
 from habitat2ros.habitat_publisher import ROSPublisherNonNode
 from llm.answer_reader.answer_reader import read_answer
 from params import HABITAT_STATE, ROS_STATE, ACTION, RESULT_TYPES
-from vlm.Labels import MP3D_ID_TO_NAME
-from vlm.utils.get_itm_message import get_itm_message_cosine
+from vlm.label_utils import normalize_objectnav_label
+from vlm.utils.get_semantic_similarity import get_semantic_similarity
 from vlm.utils.get_object_utils import get_object
 
 
@@ -104,11 +101,11 @@ class HabitatEvalNode(Node):
             PointCloud2, "habitat/object_point_cloud", qos)
         self.state_pub = self.create_publisher(Int32, "/habitat/state", qos)
         self.trigger_pub = self.create_publisher(PoseStamped, "/move_base_simple/goal", qos)
-        self.itm_score_pub = self.create_publisher(Float64, "/blip2/cosine_score", qos)
+        self.semantic_score_pub = self.create_publisher(SemanticScore, "/semantic/score", qos)
         self.confidence_threshold_pub = self.create_publisher(
             Float64, "/detector/confidence_threshold", qos)
         self.cld_with_score_pub = self.create_publisher(
-            MultipleMasksWithConfidence, "/detector/clouds_with_scores", qos)
+            MultipleMasksWithConfidence, "/yoloe/clouds_with_scores", qos)
         self.progress_pub = self.create_publisher(Int32MultiArray, "/habitat/progress", qos)
         self.record_pub = self.create_publisher(Float32MultiArray, "/habitat/record", qos)
 
@@ -186,41 +183,7 @@ def signal_handler(sig, frame):
     os._exit(0)
 
 
-def _parse_dataset_arg():
-    """Parse CLI to choose dataset and capture remaining Hydra overrides."""
-    parser = argparse.ArgumentParser(
-        description="Habitat ObjectNav Evaluation", add_help=True
-    )
-    parser.add_argument(
-        "--dataset",
-        type=str,
-        choices=["hm3dv1", "hm3dv2", "mp3d"],
-        default="hm3dv2",
-        help="Choose dataset: hm3dv1, hm3dv2 or mp3d (default: hm3dv2)",
-    )
-    parser.add_argument(
-        "--delay",
-        type=float,
-        default=0.0,
-        help="Delay in seconds between each step (default: 0.0)",
-    )
-    # Keep unknown so users can still pass Hydra-style overrides (e.g., key=value)
-    args, unknown = parser.parse_known_args()
-    return args.dataset, args.delay, unknown
-
-
 def main(cfg: DictConfig, node: HabitatEvalNode, step_delay: float = 0.0) -> None:
-    # Load MP3D validation data for object category mapping
-    with gzip.open(
-        "data/datasets/objectnav/mp3d/v1/val/val.json.gz", "rt", encoding="utf-8"
-    ) as f:
-        val_data = json.load(f)
-    category_to_coco = val_data.get("category_to_mp3d_category_id", {})
-    id_to_name = {
-        category_to_coco[cat]: MP3D_ID_TO_NAME[idx]
-        for idx, cat in enumerate(category_to_coco)
-    }
-
     start_time = time.time()
 
     node.final_state = 0
@@ -324,10 +287,7 @@ def main(cfg: DictConfig, node: HabitatEvalNode, step_delay: float = 0.0) -> Non
         del observations["camera_pitch"]
         label = env.current_episode.object_category
 
-        # Convert object category to coco name format
-        if label in category_to_coco:
-            coco_id = category_to_coco[label]
-            label = id_to_name.get(coco_id, label)
+        label = normalize_objectnav_label(label, cfg.habitat.dataset.data_path)
 
         # Get LLM answer and fusion threshold for the target object
         llm_answer, room, node.fusion_threshold = read_answer(
@@ -419,12 +379,21 @@ def main(cfg: DictConfig, node: HabitatEvalNode, step_delay: float = 0.0) -> Non
 
             observations = env.step(action)
 
-            # Calculate ITM cosine similarity score
-            cosine = get_itm_message_cosine(observations["rgb"], label, room)
+            # Capture one timestamp per observation, before inference. Re-publication
+            # preserves this identity; geometry and semantic score can arrive in either order.
+            observations["ros_stamp"] = node.get_clock().now().to_msg()
+            observations["camera_pitch"] = camera_pitch
+            node.ros_pub.habitat_publish_ros_topic(observations)
+            backend = cfg.get("semantic_model", "clip")
+            cosine = get_semantic_similarity(observations["rgb"], label, room, backend)
             print(f"Target related room: {room}")
-            print(f"ITM cosine similarity: {cosine:.3f}")
-
-            node.publish_float64(node.itm_score_pub, cosine)
+            print(f"Semantic [{backend}] raw cosine similarity: {cosine:.4f}")
+            score_msg = SemanticScore()
+            score_msg.header.stamp = observations["ros_stamp"]
+            score_msg.header.frame_id = "world"
+            score_msg.backend = backend
+            score_msg.score = float(cosine)
+            node.semantic_score_pub.publish(score_msg)
 
             # Detect objects in the current observation
             observations["rgb"], score_list, object_masks_list, label_list = get_object(
@@ -443,6 +412,7 @@ def main(cfg: DictConfig, node: HabitatEvalNode, step_delay: float = 0.0) -> Non
             )
 
             # Publish detection-related information
+            cld_with_score_msg.header = score_msg.header
             cld_with_score_msg.point_clouds = obj_point_cloud_list
             cld_with_score_msg.confidence_scores = score_list
             cld_with_score_msg.label_indices = label_list
@@ -602,28 +572,35 @@ def main(cfg: DictConfig, node: HabitatEvalNode, step_delay: float = 0.0) -> Non
     pbar.close()
 
 
-if __name__ == "__main__":
-    signal.signal(signal.SIGINT, signal_handler)
-    rclpy.init()
+def run_cli(argv=None):
+    from basic_utils.simulation_cli import parse_simulation_args, config_overrides
+    args, overrides = parse_simulation_args(argv)
 
-    # Register habitat config search path plugin before Hydra init
     from habitat.config.default_structured_configs import (
         HabitatConfigPlugin,
         register_hydra_plugin,
     )
     register_hydra_plugin(HabitatConfigPlugin)
+    with initialize(version_base=None, config_path="config"):
+        cfg = compose(config_name=f"habitat_eval_{args.dataset}",
+                      overrides=config_overrides(args.mode, overrides) +
+                      [f"+semantic_model={args.semantic_model}"])
 
+    if args.mode == 'continuous':
+        from habitat_vel_control import run_continuous
+        run_continuous(cfg)
+        return
+
+    signal.signal(signal.SIGINT, signal_handler)
+    rclpy.init()
+    node = HabitatEvalNode()
     try:
-        node = HabitatEvalNode()
-        dataset, step_delay, overrides = _parse_dataset_arg()
-        cfg_name = f"habitat_eval_{dataset}"
-        # Compose the chosen config and pass through extra Hydra overrides
-        with initialize(version_base=None, config_path="config"):
-            cfg = compose(config_name=cfg_name, overrides=overrides)
-        main(cfg, node, step_delay=step_delay)
-    except Exception as e:
-        print(f"Unexpected error occurred: {e}")
-        rclpy.shutdown()
-        os._exit(1)
+        main(cfg, node, step_delay=args.delay)
     finally:
-        rclpy.shutdown()
+        node.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()
+
+
+if __name__ == "__main__":
+    run_cli()

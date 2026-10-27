@@ -23,9 +23,7 @@ log/
 # Personal notes
 ROS2STUDY.md
 
-yolov7
-traced_model.pt
-GroundingDINO
+mobileclip_blt.ts
 habitat-lab
 
 # src/planner/utils/lkh_mtsp_solver/LKH/LKH

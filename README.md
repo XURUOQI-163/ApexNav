@@ -43,9 +43,9 @@ This is the **ROS2 Jazzy** port of [ApexNav](https://github.com/Robotics-STAR-La
 - **Executor**: MultiThreadedExecutor with separate callback groups for service calls
 
 ## Installation
-> Tested on Ubuntu 24.04 with ROS2 Jazzy and Python 3.12
+> Target platform: Ubuntu 24.04, ROS2 Jazzy and Python 3.12. The visual-service adaptation has interface tests; full GPU/Habitat validation must be run in your environment.
 
-You need to install [ROS2 Jazzy](https://docs.ros.org/en/jazzy/Installation.html), and it is recommended to use [Anaconda](https://www.anaconda.com/) or [Miniconda](https://docs.conda.io/en/latest/miniconda.html) to manage your Python environment.
+Use [ROS2 Jazzy](https://docs.ros.org/en/jazzy/Installation.html) with a Python 3.12 venv that can access the system ROS packages. Keep model services in their own environment as described below.
 
 ### 1. Prerequisites
 
@@ -67,77 +67,17 @@ curl -fsSL https://ollama.com/install.sh | sh
 ollama pull qwen3:8b
 ```
 
-#### 1.3 External Code Dependencies
-```bash
-git clone git@github.com:WongKinYiu/yolov7.git # yolov7
-git clone https://github.com/IDEA-Research/GroundingDINO.git # GroundingDINO
-```
+#### 1.3 Python and Visual Services
 
-> **Note**: GroundingDINO's CUDA extension may need rebuilding for PyTorch 2.10+. If you see `NameError: name '_C' is not defined`, edit `groundingdino/models/GroundingDINO/csrc/MsDeformAttn/ms_deform_attn_cuda.cu` and replace `value.type()` with `value.scalar_type()`, then reinstall with:
-> ```bash
-> cd GroundingDINO && CUDA_HOME=/usr/local/cuda pip install --no-build-isolation -e .
-> ```
+This ROS2 checkout uses **YOLOE instance segmentation + CLIP ViT-B/32**.
+See [the visual-service setup guide](docs/vision_services.md) for the Jazzy/Python 3.12
+client environment, separate model-service environment, weight reuse/downloads,
+ROS2 rebuild, and simulation commands. The old Python 3.9 Conda lockfile is no longer used.
 
-#### 1.4 Model Weights Download
-
-Download the following model weights and place them in the `data/` directory:
-- `mobile_sam.pt`: https://github.com/ChaoningZhang/MobileSAM/tree/master/weights/mobile_sam.pt
-- `groundingdino_swint_ogc.pth`:
-  ```bash
-  wget -O data/groundingdino_swint_ogc.pth https://github.com/IDEA-Research/GroundingDINO/releases/download/v0.1.0-alpha/groundingdino_swint_ogc.pth
-  ```
-- `yolov7-e6e.pt`:
-  ```bash
-  wget -O data/yolov7-e6e.pt https://github.com/WongKinYiu/yolov7/releases/download/v0.1/yolov7-e6e.pt
-  ```
-
-
-### 2. Setup Python Environment
-
-#### 2.1 Clone Repository
-``` bash
-git clone git@github.com:romaster93/ApexNav_ROS2_wrapper.git
-cd ApexNav_ROS2_wrapper
-```
-
-#### 2.2 Create Conda Environment
-``` bash
-conda env create -f apexnav_environment.yaml -y
-conda activate apexnav_ros2
-```
-
-#### 2.3 Pytorch
-``` bash
-# You can use 'nvcc --version' to check your CUDA version.
-# CUDA 12.8
-pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
-# CUDA 12.4
-pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124
-```
-
-#### 2.4 Habitat Simulator
-> We recommend using habitat-lab v0.3.1
-``` bash
-# habitat-lab v0.3.1
-git clone https://github.com/facebookresearch/habitat-lab.git
-cd habitat-lab; git checkout tags/v0.3.1;
-pip install -e habitat-lab
-
-# habitat-baselines v0.3.1
-pip install -e habitat-baselines
-```
-
-#### 2.5 tf_transformations
-``` bash
-pip install tf-transformations
-```
-> This installs the `tf_transformations` Python package (which depends on `transforms3d`) providing the same API as ROS1's `tf.transformations`.
-
-#### 2.6 Others
-``` bash
-pip install salesforce-lavis==1.0.2
-pip install -e .
-```
+The model services require no ROS or Habitat installation. Install their dependencies
+from `requirements-vision.txt` after installing a suitable PyTorch/CUDA build.
+The simulator uses the existing Python 3.12 Habitat environment with Jazzy bindings;
+the service environment may use a different Python interpreter.
 
 ## Datasets Download
 > Official Reference: https://github.com/facebookresearch/habitat-lab/blob/main/DATASETS.md
@@ -165,9 +105,9 @@ unzip data/datasets/objectnav/mp3d/v1.zip -d data/datasets/objectnav/mp3d/v1 && 
 ```
 
 ## Usage
-> All following commands should be run in the conda environment with ROS2 sourced:
+> Run simulator commands in the Habitat environment with ROS2 sourced (model servers use their own environment):
 > ```bash
-> conda activate apexnav_ros2
+> source /opt/apexnav_ros2_py312/bin/activate
 > source /opt/ros/jazzy/setup.bash
 > source install/setup.bash
 > ```
@@ -179,14 +119,18 @@ colcon build
 source install/setup.bash
 ```
 
-### Run VLMs Servers
-Each command should be run in a separate terminal.
-``` bash
-python -m vlm.detector.grounding_dino --port 12181
-python -m vlm.itm.blip2itm --port 12182
-python -m vlm.segmentor.sam --port 12183
-python -m vlm.detector.yolov7 --port 12184
+### Run Visual Services
+Run each command from the project root in a separate terminal, with the visual-service
+Python environment activated. See [setup and weight paths](docs/vision_services.md).
+
+```bash
+python -m vlm.detector.yoloe --port 12184 --weights data/yoloe-11l-seg.pt
+python -m vlm.similarity.clip --port 12182 --model-name ViT-B/32
 ```
+
+Check both services with `python -m vlm.check_services`.
+The simulator publishes `/yoloe/clouds_with_scores` and `/clip/cosine_score`;
+rebuild the ROS2 workspace after updating the code so the planner subscribes to these topics.
 
 ### Launch Visualization and Main Algorithm (Discrete Action Mode)
 Each command should be run in a separate terminal.
@@ -196,6 +140,13 @@ ros2 launch exploration_manager exploration.launch.py  # ApexNav main algorithm
 ```
 
 ### Evaluate Datasets in Habitat
+Select `--mode discrete` (default) or `--mode continuous` in `habitat_evaluation.py`.
+Start the matching planner with `ros2 launch exploration_manager simulation.launch.py mode:=discrete`
+or `mode:=continuous`. Continuous mode automatically starts the perception bridge.
+For independent CLIP / BLIP2 selection (`--semantic-model clip|blip2`) and timestamp-aligned semantics, see [semantic backends](docs/semantic_backends.md).
+
+See [mode selection and complete commands](docs/simulation_modes.md) for setup, budgets, and limitations.
+
 ```bash
 # Choose one dataset to evaluate
 python habitat_evaluation.py --dataset hm3dv1
@@ -258,7 +209,7 @@ This repository is a derivative work of [ApexNav](https://github.com/Robotics-ST
 > Mingjie Zhang, Yuheng Du, Chengkai Wu, Jinni Zhou, Zhenchao Qi, Jun Ma, Boyu Zhou
 > **Robotics-STAR Lab** — HKUST(GZ) & SUSTech
 
-This wrapper only provides ROS2 Jazzy compatibility. All core algorithms and intellectual property belong to the original authors.
+This checkout provides ROS2 Jazzy compatibility and adapts the visual services to YOLOE and CLIP. All core algorithms and intellectual property belong to the original authors.
 
 ## Acknowledgment
 

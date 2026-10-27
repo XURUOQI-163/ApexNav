@@ -1,10 +1,10 @@
 /**
  * @file value_map2d.cpp
- * @brief Implementation of semantic value mapping system with confidence-weighted ITM score fusion
+ * @brief Implementation of semantic value mapping system with confidence-weighted CLIP score fusion
  *
  * This file implements the ValueMap class which provides semantic value mapping capabilities
  * for autonomous navigation systems. The implementation focuses on confidence-weighted fusion
- * of ITM (Image-Text Matching) scores using field-of-view based confidence modeling.
+ * of CLIP (Image-Text Matching) scores using field-of-view based confidence modeling.
  *
  * Reference paper "VLFM: Vision-Language Frontier Maps for Zero-Shot Semantic Navigation"
  *
@@ -23,7 +23,7 @@ ValueMap::ValueMap(SDFMap2D* sdf_map, rclcpp::Node::SharedPtr node)
 }
 
 void ValueMap::updateValueMap(const Vector2d& sensor_pos, const double& sensor_yaw,
-    const vector<Vector2i>& free_grids, const double& itm_score)
+    const vector<Vector2i>& free_grids, const double& clip_score)
 {
   for (const auto& grid : free_grids) {
     Vector2d pos;
@@ -32,7 +32,7 @@ void ValueMap::updateValueMap(const Vector2d& sensor_pos, const double& sensor_y
 
     // Calculate FOV-based confidence for current observation
     double now_confidence = getFovConfidence(sensor_pos, sensor_yaw, pos);
-    double now_value = itm_score;
+    double now_value = clip_score;
 
     // Retrieve existing confidence and value
     double last_confidence = confidence_buffer_[adr];

@@ -5,39 +5,45 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "ApexNav"
 version = "0.1"
-authors = [
-    {name = "Zager-Zhang"},
-]
-description = "ApexNav"
+authors = [{name = "Zager-Zhang"}]
+description = "ApexNav ROS2 with YOLOE segmentation and CLIP scene similarity"
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 dependencies = [
+    "numpy == 1.26.4",
     "numba == 0.60.0",
-    "rospkg == 1.5.1",
-    "numpy == 1.23.5",
-    "flask == 3.0.3",
-    "seaborn == 0.13.2",
-    "open3d == 0.18.0",
-    "transformers == 4.43.2",
-    "timm == 0.4.12",
-    "prettytable >= 3.12.0",
-    "opencv-python == 4.6.0.66",
+    "numpy-quaternion",
+    "pillow == 10.4.0",
+    "scipy == 1.13.1",
+    "matplotlib == 3.9.2",
+    "opencv-python == 4.10.0.84",
+    "open3d == 0.19.0",
+    "hydra-core == 1.3.2",
+    "omegaconf == 2.3.0",
+    "gym == 0.23.0",
+    "imageio",
+    "imageio-ffmpeg",
     "moviepy == 1.0.3",
-    "mobile_sam @ git+https://github.com/ChaoningZhang/MobileSAM.git",
-    "groundingdino @ git+https://github.com/IDEA-Research/GroundingDINO.git",
-    "ultralytics==8.3.39",
-    "fastapi==0.111.1",
-    "uvicorn==0.30.3",
-    "modelscope==1.16.1",
-    "accelerate==0.32.1",
-    "openai>=1.58.1",
-    "habitat2ros @ file:./habitat2ros",
+    "prettytable >= 3.12.0",
+    "tqdm",
+    "seaborn == 0.13.2",
+    "requests",
+    "attrs",
+    "gitpython",
+    "transforms3d",
+    "openai >= 1.58.1",
     "ollama",
 ]
 
 [project.optional-dependencies]
-dev = [
-    "pre-commit >= 3.1.1",
-    "pytest >= 7.2.1",
-    "pytest-cov >= 4.0.0",
+vision = [
+    "torch == 2.5.1",
+    "torchvision == 0.20.1",
+    "flask == 3.0.3",
+    "ultralytics == 8.3.209",
+    "clip @ git+https://github.com/ultralytics/CLIP.git",
 ]
+dev = ["pytest >= 7.2.1", "pytest-cov >= 4.0.0"]
+
+[tool.setuptools.packages.find]
+include = ["basic_utils*", "habitat2ros*", "llm*", "vlm*"]

@@ -47,7 +47,7 @@ class ROSPublisher(Node):
         rgb_msg.header.frame_id = "world"
         self.rgb_pub.publish(rgb_msg)
 
-    def publish_robot_odom(self, ros_time, gps, compass):
+    def publish_robot_odom(self, ros_time, gps, compass, linear_velocity=0.0, angular_velocity=0.0):
         copy_compass = deepcopy(compass)
         odom = Odometry()
         odom.header.stamp = ros_time
@@ -57,6 +57,8 @@ class ROSPublisher(Node):
             position=Point(x=float(-gps[2]), y=float(-gps[0]), z=float(gps[1])),
             orientation=_quat_from_array(quaternion_from_euler(0, 0, copy_compass)),
         )
+        odom.twist.twist.linear.x = float(linear_velocity)
+        odom.twist.twist.angular.z = float(angular_velocity)
         self.odom_pub.publish(odom)
 
     def publish_camera_odom(self, ros_time, gps, compass, pitch):
@@ -80,11 +82,13 @@ class ROSPublisher(Node):
         gps = observations["gps"]
         compass = observations["compass"]
         camera_pitch = observations["camera_pitch"]
-        ros_time = self.get_clock().now().to_msg()
+        ros_time = observations.get("ros_stamp") or self.get_clock().now().to_msg()
         self.publish_depth(ros_time, depth_image)
         self.publish_camera_odom(ros_time, gps, compass, camera_pitch)
         self.publish_rgb(ros_time, rgb_image)
-        self.publish_robot_odom(ros_time, gps, compass)
+        self.publish_robot_odom(
+            ros_time, gps, compass, observations.get("linear_velocity", 0.0),
+            observations.get("angular_velocity", 0.0))
 
 
 class ROSPublisherNonNode:
@@ -111,7 +115,7 @@ class ROSPublisherNonNode:
         rgb_msg.header.frame_id = "world"
         self.rgb_pub.publish(rgb_msg)
 
-    def publish_robot_odom(self, ros_time, gps, compass):
+    def publish_robot_odom(self, ros_time, gps, compass, linear_velocity=0.0, angular_velocity=0.0):
         copy_compass = deepcopy(compass)
         odom = Odometry()
         odom.header.stamp = ros_time
@@ -121,6 +125,8 @@ class ROSPublisherNonNode:
             position=Point(x=float(-gps[2]), y=float(-gps[0]), z=float(gps[1])),
             orientation=_quat_from_array(quaternion_from_euler(0, 0, copy_compass)),
         )
+        odom.twist.twist.linear.x = float(linear_velocity)
+        odom.twist.twist.angular.z = float(angular_velocity)
         self.odom_pub.publish(odom)
 
     def publish_camera_odom(self, ros_time, gps, compass, pitch):
@@ -144,8 +150,10 @@ class ROSPublisherNonNode:
         gps = observations["gps"]
         compass = observations["compass"]
         camera_pitch = observations["camera_pitch"]
-        ros_time = self.node.get_clock().now().to_msg()
+        ros_time = observations.get("ros_stamp") or self.node.get_clock().now().to_msg()
         self.publish_depth(ros_time, depth_image)
         self.publish_camera_odom(ros_time, gps, compass, camera_pitch)
         self.publish_rgb(ros_time, rgb_image)
-        self.publish_robot_odom(ros_time, gps, compass)
+        self.publish_robot_odom(
+            ros_time, gps, compass, observations.get("linear_velocity", 0.0),
+            observations.get("angular_velocity", 0.0))

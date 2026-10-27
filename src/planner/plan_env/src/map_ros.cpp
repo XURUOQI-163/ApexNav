@@ -166,13 +166,13 @@ void MapROS::init()
   confidence_map_pub_ = node_->create_publisher<sensor_msgs::msg::PointCloud2>(
       "/grid_map/confidence_map", 10);
 
-  // Setup subscribers for object detection and ITM scores
+  // Setup subscribers for object detection and CLIP scores
   detected_object_cloud_sub_ = node_->create_subscription<plan_env::msg::MultipleMasksWithConfidence>(
-      "/detector/clouds_with_scores", 10,
+      "/yoloe/clouds_with_scores", 10,
       std::bind(&MapROS::detectedObjectCloudCallback, this, std::placeholders::_1));
-  itm_score_sub_ = node_->create_subscription<std_msgs::msg::Float64>(
-      "/blip2/cosine_score", 10,
-      std::bind(&MapROS::itmScoreCallback, this, std::placeholders::_1));
+  semantic_score_sub_ = node_->create_subscription<plan_env::msg::SemanticScore>(
+      "/semantic/score", 10,
+      std::bind(&MapROS::semanticScoreCallback, this, std::placeholders::_1));
 
   // Setup synchronized subscribers for depth image and pose data
   rmw_qos_profile_t qos_profile = rmw_qos_profile_sensor_data;
@@ -188,8 +188,18 @@ void MapROS::init()
 
   // Initialize object tracking variables
   continue_over_depth_count_ = -1;
-  itm_score_ = -1.0;
   map_start_time_ = node_->get_clock()->now();
+  if (!node_->has_parameter("semantic/max_observation_age"))
+    node_->declare_parameter("semantic/max_observation_age", 15.0);
+  if (!node_->has_parameter("semantic/cache_size"))
+    node_->declare_parameter("semantic/cache_size", 600);
+  const double max_age = node_->get_parameter("semantic/max_observation_age").as_double();
+  const int capacity = node_->get_parameter("semantic/cache_size").as_int();
+  if (!std::isfinite(max_age) || max_age <= 0 || max_age > 3600 || capacity <= 0)
+    throw std::invalid_argument("Invalid semantic observation cache parameters");
+  semantic_cache_ = SemanticCache(capacity, static_cast<int64_t>(max_age * 1e9),
+                                  map_start_time_.nanoseconds());
+  semantic_backend_.clear();
 }
 
 void MapROS::visCallback()
@@ -206,13 +216,57 @@ void MapROS::visCallback()
   // publishUpdateRange();
 }
 
-void MapROS::itmScoreCallback(const std_msgs::msg::Float64::SharedPtr msg)
+void MapROS::semanticScoreCallback(const plan_env::msg::SemanticScore::SharedPtr msg)
 {
-  itm_score_ = msg->data;
+  const int64_t stamp = rclcpp::Time(msg->header.stamp).nanoseconds();
+  const int64_t now = node_->get_clock()->now().nanoseconds();
+  if (stamp <= map_start_time_.nanoseconds() || msg->header.frame_id != frame_id_ ||
+      (msg->backend != "clip" && msg->backend != "blip2") ||
+      !std::isfinite(msg->score) || msg->score < -1.0 || msg->score > 1.0)
+    return;
+  if (semantic_backend_.empty()) semantic_backend_ = msg->backend;
+  if (semantic_backend_ != msg->backend) {
+    RCLCPP_WARN_THROTTLE(node_->get_logger(), *node_->get_clock(), 5000,
+        "[Semantic] Mixed backends rejected; restart planner when switching models");
+    return;
+  }
+  applySemanticMatch(semantic_cache_.addScore(stamp, now, msg->score));
+  RCLCPP_INFO_THROTTLE(node_->get_logger(), *node_->get_clock(), 5000,
+      "[Semantic] backend=%s age=%.3fs cached=%zu discarded=%zu",
+      msg->backend.c_str(), (now - stamp) * 1e-9,
+      semantic_cache_.size(), semantic_cache_.dropped());
+}
+
+void MapROS::applySemanticMatch(const std::optional<SemanticCache::Match>& match)
+{
+  if (!match) return;
+  const auto& observation = *match->observation;
+  map_->value_map_->updateValueMap(observation.camera_pos, observation.camera_yaw,
+                                  observation.free_grids, match->score);
+  match->observation->score = match->score;
+  applyObjectObservation(match->observation);
+  RCLCPP_DEBUG(node_->get_logger(), "[Semantic] fused stamp=%lld pose=(%.3f,%.3f) score=%.4f cells=%zu",
+      static_cast<long long>(match->stamp), observation.camera_pos.x(), observation.camera_pos.y(),
+      match->score, observation.free_grids.size());
+}
+
+void MapROS::applyObjectObservation(const std::shared_ptr<SemanticObservation>& observation)
+{
+  if (!observation->has_detection || !observation->score || observation->object_observation_applied)
+    return;
+  observation->object_observation_applied = true;
+  getObservationObjectsCloud(observation->detected_ids, observation->depth_cloud, *observation->score);
 }
 
 void MapROS::detectedObjectCloudCallback(const plan_env::msg::MultipleMasksWithConfidence::SharedPtr msg)
 {
+  const auto original = semantic_cache_.observation(
+      rclcpp::Time(msg->header.stamp).nanoseconds(), node_->get_clock()->now().nanoseconds());
+  if (!original || msg->header.frame_id != frame_id_ || (*original)->has_detection) return;
+  const auto observation = *original;
+  // Camera-dependent filtering must use the pose that produced these detections.
+  const auto& camera_pos_ = observation->camera_pos3;
+  const auto& camera_q_ = observation->camera_q;
   // Validate message structure consistency
   if (!(msg->confidence_scores.size() == msg->point_clouds.size() &&
           msg->confidence_scores.size() == msg->label_indices.size())) {
@@ -326,7 +380,9 @@ void MapROS::detectedObjectCloudCallback(const plan_env::msg::MultipleMasksWithC
   map_->inputObjectCloud2D(detected_objects, detected_object_cluster_ids);
 
   // Extract observation data from depth sensor for objects not detected by vision
-  getObservationObjectsCloud(detected_object_cluster_ids);
+  observation->detected_ids = std::move(detected_object_cluster_ids);
+  observation->has_detection = true;
+  applyObjectObservation(observation);
 
   double object_map_process_time = (node_->get_clock()->now() - t1).seconds();
   RCLCPP_INFO_THROTTLE(node_->get_logger(), *node_->get_clock(), 10000,
@@ -390,13 +446,24 @@ void MapROS::depthPoseCallback(
   RCLCPP_INFO_THROTTLE(node_->get_logger(), *node_->get_clock(), 50000,
       "[Calculating Time] Grid Map process time = %.3f s", process_time);
 
-  t1 = node_->get_clock()->now();
-  // Update semantic value map if ITM score is available
-  if (itm_score_ != -1.0)
-    map_->value_map_->updateValueMap(camera_pos, camera_yaw, free_grids, itm_score_);
-  double value_map_time = (node_->get_clock()->now() - t1).seconds();
-  RCLCPP_INFO_THROTTLE(node_->get_logger(), *node_->get_clock(), 50000,
-      "[Calculating Time] Value Map process time = %.3f s", value_map_time);
+  // Save geometry from this acquisition, not the camera pose at inference completion.
+  // The score may arrive before or after this depth/pose pair; each stamp fuses once.
+  auto observation = std::make_shared<SemanticObservation>();
+  observation->camera_pos = camera_pos;
+  observation->camera_yaw = camera_yaw;
+  observation->free_grids = std::move(free_grids);
+  observation->camera_pos3 = camera_pos_;
+  observation->camera_q = camera_q_;
+  // Retain a compact depth snapshot for time-aligned negative object evidence.
+  PointCloud3D::Ptr valid_cloud(new PointCloud3D());
+  valid_cloud->points.assign(depth_cloud_->points.begin(), depth_cloud_->points.begin() + proj_points_cnt_);
+  observation->depth_cloud.reset(new PointCloud3D());
+  pcl::VoxelGrid<Point3D> snapshot_filter;
+  snapshot_filter.setInputCloud(valid_cloud);
+  snapshot_filter.setLeafSize(0.1f, 0.1f, 0.1f);
+  snapshot_filter.filter(*observation->depth_cloud);
+  applySemanticMatch(semantic_cache_.addObservation(
+      rclcpp::Time(img->header.stamp).nanoseconds(), node_->get_clock()->now().nanoseconds(), observation));
 
   // Trigger ESDF update if local map has been updated
   if (local_updated_) {
@@ -449,20 +516,17 @@ void MapROS::processDepthImage()
   publishPointCloud(depth_cloud_pub_, depth_cloud_);
 }
 
-void MapROS::getObservationObjectsCloud(const std::vector<int>& filter_object_ids)
+void MapROS::getObservationObjectsCloud(const std::vector<int>& filter_object_ids,
+    const PointCloud3D::Ptr& filtered_depth_cloud, double score)
 {
-  // Downsample depth cloud for efficient processing
-  PointCloud3D::Ptr filtered_depth_cloud(new PointCloud3D());
-  pcl::VoxelGrid<Point3D> voxel_filter;
-  voxel_filter.setInputCloud(depth_cloud_);
-  voxel_filter.setLeafSize(0.1f, 0.1f, 0.1f);
-  voxel_filter.filter(*filtered_depth_cloud);
 
   // Get object bounding boxes and create filter flags
   vector<Eigen::Vector3d> bmins, bmaxs;
   map_->object_map2d_->getObjectBoxes(bmins, bmaxs);
   vector<char> filter_object_flag(bmins.size(), 0);
-  for (auto filter_object_id : filter_object_ids) filter_object_flag[filter_object_id] = 1;
+  for (auto filter_object_id : filter_object_ids)
+    if (filter_object_id >= 0 && static_cast<size_t>(filter_object_id) < filter_object_flag.size())
+      filter_object_flag[filter_object_id] = 1;
 
   // Use CropBox filter to extract points within object bounding boxes
   pcl::CropBox<Point3D> crop_box_filter;
@@ -485,8 +549,8 @@ void MapROS::getObservationObjectsCloud(const std::vector<int>& filter_object_id
     }
   }
 
-  // Update object map with observation data (using max of 0 and ITM score)
-  map_->object_map2d_->inputObservationObjectsCloud(observation_clouds, max(0.0, itm_score_));
+  // Original fusion rule, using only the score from this depth observation.
+  map_->object_map2d_->inputObservationObjectsCloud(observation_clouds, max(0.0, score));
 }
 
 void MapROS::filterPointCloudToXY()

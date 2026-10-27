@@ -1,0 +1,9 @@
+# Install torch==2.5.1 and torchvision==0.20.1 from the appropriate CUDA index first.
+# These dependencies are for the standalone model servers, not ROS2 bindings.
+numpy==1.26.4
+pillow==10.4.0
+opencv-python==4.10.0.84
+requests
+flask==3.0.3
+ultralytics==8.3.209
+clip @ git+https://github.com/ultralytics/CLIP.git

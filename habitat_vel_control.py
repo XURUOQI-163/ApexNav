@@ -1,299 +1,218 @@
-import os
-import signal
-import gzip
+"""Continuous Habitat simulation driven by the trajectory controller's /cmd_vel.
+
+Use habitat_evaluation.py --mode continuous for the shared dataset/override CLI.
+The perception bridge runs in a child process so HTTP inference cannot block the
+velocity integration loop. YOLOE and CLIP model servers remain external.
+"""
 import json
+import math
+import multiprocessing
 import time
 
 import habitat
-import numpy as np
-from habitat.sims.habitat_simulator.actions import HabitatSimActions
-from omegaconf import DictConfig
-from habitat.config.default import patch_config
-import hydra  # noqa
-from habitat2ros.habitat_publisher import ROSPublisherNonNode
-import rclpy
-from rclpy.node import Node
-from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
-from copy import deepcopy
-from std_msgs.msg import Float64, String
-from vlm.Labels import MP3D_ID_TO_NAME
-from geometry_msgs.msg import Twist, PoseStamped
 import habitat_sim
+import numpy as np
+import rclpy
+from geometry_msgs.msg import PoseStamped, Twist
+from habitat.config.default import patch_config
+from habitat.config.default_structured_configs import CollisionsMeasurementConfig
+from habitat.sims.habitat_simulator.actions import HabitatSimActions
 from habitat_sim.utils import common as utils
+from omegaconf import OmegaConf
+from rclpy.node import Node
+from std_msgs.msg import Empty, Int32, String
 
-from habitat.config.default_structured_configs import (
-    CollisionsMeasurementConfig,
-    FogOfWarConfig,
-    TopDownMapMeasurementConfig,
-)
-from habitat.utils.visualizations.utils import observations_to_image
+from basic_utils.velocity_command import VelocityCommand
+from habitat2ros.habitat_publisher import ROSPublisherNonNode
+from params import HABITAT_STATE
+from vlm.label_utils import normalize_objectnav_label
 
 
 class HabitatVelControlNode(Node):
-    def __init__(self):
-        super().__init__('habitat_ros_publisher')
-
-        # QoS profile
-        qos = QoSProfile(
-            reliability=ReliabilityPolicy.RELIABLE,
-            history=HistoryPolicy.KEEP_LAST,
-            depth=10
-        )
-
-        # State variables
-        self.msg_observations = None
-        self.fusion_score = 0.3
-        self.cmd_vel = 0.0
-        self.cmd_omega = 0.0
-        self.pub_timer = None
-
-        # Publishers
-        self.itm_score_pub = self.create_publisher(Float64, "/blip2/cosine_score", qos)
-        self.confidence_threshold_pub = self.create_publisher(
-            Float64, "/detector/confidence_threshold", qos)
-        self.label_pub = self.create_publisher(String, "/detector/label", 1)
-        self.trigger_pub = self.create_publisher(PoseStamped, "/move_base_simple/goal", qos)
-
-        # ROS Publisher for habitat topics
+    def __init__(self, command_timeout=.5):
+        super().__init__('habitat_velocity_simulator')
+        self.command = VelocityCommand(command_timeout)
+        self.stop_requested = False
+        self.create_subscription(Twist, '/cmd_vel', self.cmd_vel_callback, 1)
+        self.create_subscription(Int32, '/habitat/plan_action', self.action_callback, 10)
+        self.label_pub = self.create_publisher(String, '/detector/label', 1)
+        self.trigger_pub = self.create_publisher(PoseStamped, '/move_base_simple/goal', 10)
+        self.stop_pub = self.create_publisher(Empty, '/traj_server/stop', 10)
+        self.state_pub = self.create_publisher(Int32, '/habitat/state', 10)
         self.ros_pub = ROSPublisherNonNode(self)
 
-        # Subscribers
-        self.create_subscription(Twist, "/cmd_vel", self.cmd_vel_callback, qos)
-
     def cmd_vel_callback(self, msg):
-        self.cmd_vel = msg.linear.x
-        self.cmd_omega = msg.angular.z
+        self.command.update(msg.linear.x, msg.angular.z)
 
-    def publish_observations_callback(self):
-        """Timer callback to publish habitat observations"""
-        if self.msg_observations is None:
-            return
-        tmp = deepcopy(self.msg_observations)
-        self.ros_pub.habitat_publish_ros_topic(tmp)
-        msg = Float64()
-        msg.data = float(self.fusion_score)
-        self.confidence_threshold_pub.publish(msg)
+    def action_callback(self, msg):
+        # The trajectory FSM only uses this topic to request task completion.
+        if msg.data == 0:
+            self.stop_requested = True
+            self.command.stop()
 
-    def start_observation_timer(self):
-        """Start timer for publishing observations"""
-        self.pub_timer = self.create_timer(0.1, self.publish_observations_callback)
-
-    def stop_observation_timer(self):
-        """Stop observation timer"""
-        if self.pub_timer is not None:
-            self.pub_timer.cancel()
-            self.pub_timer = None
+    def wait_for_controller(self, timeout=10.):
+        deadline = time.monotonic() + timeout
+        while rclpy.ok() and time.monotonic() < deadline:
+            rclpy.spin_once(self, timeout_sec=.1)
+            if self.count_publishers('/cmd_vel'):
+                return
+        raise RuntimeError(
+            'No /cmd_vel publisher. Start the planner with '
+            'ros2 launch exploration_manager simulation.launch.py mode:=continuous '
+            'in the same ROS_DOMAIN_ID, and stop the discrete planner first.')
 
 
-def signal_handler(sig, frame):
-    print("Ctrl+C detected! Shutting down...")
-    rclpy.shutdown()
-    os._exit(0)
-
-
-def transform_rgb_bgr(image):
-    return image[:, :, [2, 1, 0]]
-
-
-@hydra.main(
-    version_base=None,
-    config_path="config",
-    config_name="habitat_vel_control",
-)
-def main(cfg: DictConfig) -> None:
+def _run_perception(config, stop_event):
+    """Spawn entry point: a fresh ROS context, without creating a Habitat scene."""
+    from real_world_test_example.real_world_test_habitat import RealWorldNode
     rclpy.init()
-    node = HabitatVelControlNode()
-
+    node = RealWorldNode(OmegaConf.create(config))
     try:
-        run_simulation(cfg, node)
-    except Exception as e:
-        print(f"Unexpected error occurred: {e}")
-        rclpy.shutdown()
-        os._exit(1)
+        while rclpy.ok() and not stop_event.is_set():
+            rclpy.spin_once(node, timeout_sec=.1)
     finally:
-        rclpy.shutdown()
+        node.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
-def run_simulation(cfg: DictConfig, node: HabitatVelControlNode):
-    with gzip.open(
-        "data/datasets/objectnav/mp3d/v1/val/val.json.gz", "rt", encoding="utf-8"
-    ) as f:
-        val_data = json.load(f)
-    category_to_coco = val_data.get("category_to_mp3d_category_id", {})
-    id_to_name = {
-        category_to_coco[cat]: MP3D_ID_TO_NAME[idx]
-        for idx, cat in enumerate(category_to_coco)
-    }
-
+def run_simulation(cfg, node, perception_process):
     cfg = patch_config(cfg)
-    env_count = cfg.test_epi_num
-    print(env_count)
-    cfg_rgb_sensor = cfg.habitat.simulator.agents.main_agent.sim_sensors.rgb_sensor
-
-    height = cfg_rgb_sensor["height"]
-    width = cfg_rgb_sensor["width"]
-    node.fusion_score = 0.3
-
-    # Control-related parameters
-    fps = 30.0
-    time_step = 1.0 / fps
-
-    # Add top_down_map and collision measurements
+    fps = float(cfg.continuous.control_hz)
+    scan_seconds = float(cfg.continuous.initial_scan_seconds)
+    if not math.isfinite(fps) or fps <= 0:
+        raise ValueError('continuous.control_hz must be positive and finite')
+    if not math.isfinite(scan_seconds) or scan_seconds < 0:
+        raise ValueError('continuous.initial_scan_seconds must be nonnegative and finite')
+    if cfg.habitat.simulator.forward_step_size != 0:
+        raise ValueError('Continuous mode requires habitat.simulator.forward_step_size=0 to avoid double motion')
+    if cfg.need_video:
+        raise ValueError('Continuous mode currently publishes live RGB/RViz only; use need_video=false')
+    time_step = 1. / fps
+    episode_index = int(cfg.test_epi_num)
+    if episode_index < -1:
+        raise ValueError('test_epi_num must be -1 or a nonnegative episode index')
+    # Continuous mode is a single-episode runner; -1 selects the first episode.
+    episode_index = max(0, episode_index)
     with habitat.config.read_write(cfg):
-        cfg.habitat.task.measurements.update(
-            {
-                "top_down_map": TopDownMapMeasurementConfig(
-                    map_padding=3,
-                    map_resolution=256,
-                    draw_source=True,
-                    draw_border=True,
-                    draw_shortest_path=True,
-                    draw_view_points=True,
-                    draw_goal_positions=True,
-                    draw_goal_aabbs=False,
-                    fog_of_war=FogOfWarConfig(
-                        draw=True,
-                        visibility_dist=5.0,
-                        fov=79,
-                    ),
-                ),
-                "collisions": CollisionsMeasurementConfig(),
-            }
-        )
-    env = habitat.Env(cfg)
-    sim = env.sim
-    vel_control = habitat_sim.physics.VelocityControl()
-    vel_control.controlling_lin_vel = True
-    vel_control.controlling_ang_vel = True
-    vel_control.lin_vel_is_local = True
-    vel_control.ang_vel_is_local = True
+        cfg.habitat.task.measurements.collisions = CollisionsMeasurementConfig()
 
-    print("Environment creation successful")
-    while env_count:
-        env.current_episode = next(env.episode_iterator)
-        env_count -= 1
-    observations = env.reset()
-    observations["rgb"] = transform_rgb_bgr(observations["rgb"])
+    with habitat.Env(cfg) as env:
+        if episode_index >= len(env.episodes):
+            raise ValueError(f'Episode index {episode_index} is outside [0, {len(env.episodes) - 1}]')
+        env.current_episode = env.episodes[episode_index]
+        observations = env.reset()
+        episode = env.current_episode
+        label = normalize_objectnav_label(episode.object_category, cfg.habitat.dataset.data_path)
+        print(f'Continuous mode: index={episode_index}, episode_id={episode.episode_id}, '
+              f'scene={episode.scene_id}, target={label}', flush=True)
 
-    agent = sim.agents[0]
+        sim = env.sim
+        agent = sim.agents[0]
+        control = habitat_sim.physics.VelocityControl()
+        control.controlling_lin_vel = control.controlling_ang_vel = True
+        control.lin_vel_is_local = control.ang_vel_is_local = True
+        elapsed_sim_time = 0.
+        last_trigger_time = -math.inf
+        last_label_time = -math.inf
+        frames = 0
 
-    info = env.get_metrics()
-    frame = observations_to_image(observations, info)
-    # cv2.imshow("Observations", frame)
+        while rclpy.ok() and not env.episode_over:
+            loop_start = time.monotonic()
+            rclpy.spin_once(node, timeout_sec=0.)
+            if not perception_process.is_alive():
+                raise RuntimeError(f'Visual processing node exited ({perception_process.exitcode}); see its traceback')
+            if node.stop_requested:
+                env.step(HabitatSimActions.stop)
+                break
 
-    camera_pitch = 0.0
-    observations["camera_pitch"] = camera_pitch
-    observations["linear_velocity"] = 0.0
-    observations["angular_velocity"] = 0.0
-    node.msg_observations = deepcopy(observations)
+            linear, angular = node.command.sample()
+            if elapsed_sim_time < scan_seconds:
+                # Preserve the existing initial panoramic scan before triggering
+                # trajectory planning. No translation while collecting the map.
+                linear, angular = 0., math.pi / 2.
+            control.linear_velocity = np.array([0., 0., -linear])
+            control.angular_velocity = np.array([0., angular, 0.])
+            state = agent.state
+            previous = habitat_sim.RigidState(utils.quat_to_magnum(state.rotation), state.position)
+            target = control.integrate_transform(time_step, previous)
+            end_position = sim.step_filter(previous.translation, target.translation)
+            actual_speed = float(np.linalg.norm(np.asarray(end_position) - np.asarray(previous.translation))) / time_step
+            actual_speed = math.copysign(actual_speed, linear) if linear else 0.
+            state.position = end_position
+            state.rotation = utils.quat_from_magnum(target.rotation)
+            agent.set_state(state)
 
-    # Start timer for periodic observation publishing
-    node.start_observation_timer()
+            # A zero-distance action advances task bookkeeping/sensors only;
+            # translation has already been integrated and NavMesh-filtered above.
+            observations = env.step(HabitatSimActions.move_forward)
+            observations['camera_pitch'] = 0.
+            observations['linear_velocity'] = actual_speed
+            observations['angular_velocity'] = angular
+            node.ros_pub.habitat_publish_ros_topic(observations)
+            if loop_start - last_label_time >= .5:
+                node.label_pub.publish(String(data=label))
+                last_label_time = loop_start
+            if elapsed_sim_time >= scan_seconds and loop_start - last_trigger_time >= .5:
+                node.trigger_pub.publish(PoseStamped())
+                last_trigger_time = loop_start
+            frames += 1
+            elapsed_sim_time += time_step
+            if frames % max(1, round(fps * 5)) == 0:
+                node.get_logger().info(f'Finding {label}: v={actual_speed:.3f} m/s, w={angular:.3f} rad/s, tick={frames}')
+            time.sleep(max(0., time_step - (time.monotonic() - loop_start)))
 
-    print("Agent stepping around inside environment.")
+        metrics = env.get_metrics()
+        summary = {key: metrics[key] for key in ['success','spl','soft_spl','distance_to_goal','collisions'] if key in metrics}
+        print('Continuous episode metrics: ' + json.dumps(summary, default=float), flush=True)
+        print('Continuous ticks and time budgets differ from discrete action evaluation.', flush=True)
 
-    label = env.current_episode.object_category
 
-    if label in category_to_coco:
-        coco_id = category_to_coco[label]
-        label = id_to_name.get(coco_id, label)
-
-    # Publish the selected label so external nodes (e.g. real-world node) can receive it
+def run_continuous(cfg):
+    """Own the simulator ROS node and the automatically managed visual bridge."""
+    rclpy.init()
+    node = None
+    process = None
+    stop_event = None
     try:
-        label_msg = String()
-        label_msg.data = label
-        node.label_pub.publish(label_msg)
-        node.get_logger().info(f"Published target label: {label}")
-    except Exception as e:
-        print(f"Failed to publish label: {e}")
-
-    tmp_cnt = 0
-    last_time = node.get_clock().now()
-
-    while rclpy.ok() and not env.episode_over:
-        loop_begin_time = node.get_clock().now()
-
-        # Process ROS callbacks
-        rclpy.spin_once(node, timeout_sec=0.0)
-
-        object_mask = np.zeros((height, width), dtype=np.uint8)
-        vel_control.linear_velocity = np.array([0.0, 0.0, 0.0])  # y+ None x-
-        vel_control.angular_velocity = np.array([0.0, 0.0, 0.0])
-        node.stop_observation_timer()
-
-        vel_control.linear_velocity = np.array([0.0, 0.0, -node.cmd_vel])
-        vel_control.angular_velocity = np.array([0.0, node.cmd_omega, 0.0])
-
-        tmp_cnt += 1
-        if tmp_cnt >= 1 and tmp_cnt <= 4.0 * fps + 5:
-            vel_control.angular_velocity = np.array([0.0, np.pi / 2.0, 0.0])
-
-        agent_state = agent.state
-        previous_rigid_state = habitat_sim.RigidState(
-            utils.quat_to_magnum(agent_state.rotation), agent_state.position
-        )
-        target_rigid_state = vel_control.integrate_transform(
-            time_step, previous_rigid_state
-        )
-        end_pos = sim.step_filter(
-            previous_rigid_state.translation, target_rigid_state.translation
-        )
-        agent_state.position = end_pos
-        agent_state.rotation = utils.quat_from_magnum(target_rigid_state.rotation)
-        agent.set_state(agent_state)
-
-        # Log periodically
-        current_time = node.get_clock().now()
-        if (current_time - last_time).nanoseconds / 1e9 >= 5.0:
-            node.get_logger().info(f"I'm finding {label}")
-            last_time = current_time
-
-        observations = env.step(HabitatSimActions.move_forward)
-
-        habitat_env_time = node.get_clock().now() - loop_begin_time
-
-        info = env.get_metrics()
-
-        observations["camera_pitch"] = camera_pitch
-        observations["linear_velocity"] = node.cmd_vel
-        observations["angular_velocity"] = node.cmd_omega
-        node.ros_pub.habitat_publish_ros_topic(observations)
-        msg = Float64()
-        msg.data = 0.5
-        node.confidence_threshold_pub.publish(msg)
-
-        # Republish label periodically so late-joining nodes can receive it
-        label_msg = String()
-        label_msg.data = label
-        node.label_pub.publish(label_msg)
-
-        observations["rgb"] = transform_rgb_bgr(observations["rgb"])
-        del observations["camera_pitch"]
-        del observations["linear_velocity"]
-        del observations["angular_velocity"]
-        frame = observations_to_image(observations, info)
-
-        habitat_env_time_sec = habitat_env_time.nanoseconds / 1e9
-        if habitat_env_time_sec >= time_step:
-            print(
-                f"env step time: {habitat_env_time_sec*1000.0:.1f}ms VS {time_step*1000.0:.1f}ms"
-            )
-
-        # Rate limiting
-        elapsed = (node.get_clock().now() - loop_begin_time).nanoseconds / 1e9
-        sleep_time = time_step - elapsed
-        if sleep_time > 0:
-            time.sleep(sleep_time)
-
-    env.close()
+        node = HabitatVelControlNode(command_timeout=float(cfg.continuous.command_timeout))
+        node.wait_for_controller()
+        # Resolve the selected dataset configuration before passing it to the
+        # visual bridge, including its matching LLM cache and camera parameters.
+        cfg = patch_config(cfg)
+        context = multiprocessing.get_context('spawn')
+        stop_event = context.Event()
+        process = context.Process(
+            target=_run_perception, args=(OmegaConf.to_container(cfg, resolve=True), stop_event),
+            name='apexnav_continuous_perception')
+        process.start()
+        run_simulation(cfg, node, process)
+    except KeyboardInterrupt:
+        print('Continuous simulation interrupted.', flush=True)
+    finally:
+        if node is not None:
+            node.command.stop()
+            if rclpy.ok():
+                node.stop_pub.publish(Empty())
+                node.state_pub.publish(Int32(data=HABITAT_STATE.EPISODE_FINISH))
+                rclpy.spin_once(node, timeout_sec=.1)
+        if process is not None:
+            stop_event.set()
+            # Let an in-flight HTTP inference finish before shutting down ROS.
+            process.join(timeout=2.)
+            if process.is_alive():
+                process.terminate()
+            process.join(timeout=5.)
+            if process.is_alive():
+                process.kill()
+                process.join(timeout=2.)
+        if node is not None:
+            node.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
-if __name__ == "__main__":
-    signal.signal(signal.SIGINT, signal_handler)
-
-    try:
-        main()
-    except Exception as e:
-        print(f"Unexpected error occurred: {e}")
-        rclpy.shutdown()
-        os._exit(1)
+if __name__ == '__main__':
+    import sys
+    from habitat_evaluation import run_cli
+    run_cli(['--mode', 'continuous', *sys.argv[1:]])

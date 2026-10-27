@@ -10,6 +10,8 @@
 
 // Custom messages and mapping components
 #include <plan_env/msg/multiple_masks_with_confidence.hpp>
+#include <plan_env/msg/semantic_score.hpp>
+#include <plan_env/semantic_observation_cache.h>
 #include <plan_env/sdf_map2d.h>
 #include <plan_env/object_map2d.h>
 #include <plan_env/value_map2d.h>
@@ -69,7 +71,23 @@ private:
       const nav_msgs::msg::Odometry::ConstSharedPtr& pose);
   void updateESDFCallback();
   void detectedObjectCloudCallback(const plan_env::msg::MultipleMasksWithConfidence::SharedPtr msg);
-  void itmScoreCallback(const std_msgs::msg::Float64::SharedPtr msg);
+  void semanticScoreCallback(const plan_env::msg::SemanticScore::SharedPtr msg);
+  struct SemanticObservation {
+    Eigen::Vector2d camera_pos;
+    double camera_yaw;
+    std::vector<Eigen::Vector2i> free_grids;
+    Eigen::Vector3d camera_pos3;
+    Eigen::Quaterniond camera_q;
+    PointCloud3D::Ptr depth_cloud;
+    std::vector<int> detected_ids;
+    std::optional<double> score;
+    bool has_detection = false, object_observation_applied = false;
+  };
+  using SemanticCache = SemanticObservationCache<std::shared_ptr<SemanticObservation>>;
+  void applyObjectObservation(const std::shared_ptr<SemanticObservation>& observation);
+  SemanticCache semantic_cache_;
+  std::string semantic_backend_;
+  void applySemanticMatch(const std::optional<SemanticCache::Match>& match);
   void visCallback();
 
   // Visualization publishing functions
@@ -91,7 +109,7 @@ private:
   void processDepthImage();     ///< Process raw depth image into 3D point cloud
   void filterPointCloudToXY();  ///< Filter 3D points to 2D occupancy grid representation
   void getObservationObjectsCloud(
-      const std::vector<int>& filter_object_ids);  ///< Extract undetected objects from depth data
+      const std::vector<int>& filter_object_ids, const PointCloud3D::Ptr& depth_cloud, double score);
 
   // Utility functions
   bool interpolateLineAtZ(
@@ -103,7 +121,7 @@ private:
   SDFMap2D* map_;
 
   // Message synchronization types
-  using SyncPolicyImagePose = message_filters::sync_policies::ApproximateTime<
+  using SyncPolicyImagePose = message_filters::sync_policies::ExactTime<
       sensor_msgs::msg::Image, nav_msgs::msg::Odometry>;
   using SynchronizerImagePose = std::shared_ptr<message_filters::Synchronizer<SyncPolicyImagePose>>;
 
@@ -131,7 +149,7 @@ private:
 
   // ROS2 subscribers for sensor data
   rclcpp::Subscription<plan_env::msg::MultipleMasksWithConfidence>::SharedPtr detected_object_cloud_sub_;
-  rclcpp::Subscription<std_msgs::msg::Float64>::SharedPtr itm_score_sub_;
+  rclcpp::Subscription<plan_env::msg::SemanticScore>::SharedPtr semantic_score_sub_;
 
   // ROS2 timers for periodic updates
   rclcpp::TimerBase::SharedPtr esdf_timer_;
@@ -161,9 +179,8 @@ private:
   PointCloud3D::Ptr depth_cloud_;             ///< Raw 3D point cloud from depth sensor
   PointCloud2D::Ptr filtered_depth_cloud2d_;  ///< Filtered 2D point cloud for occupancy mapping
 
-  // Object detection and ITM integration
+  // Object detection and CLIP integration
   int continue_over_depth_count_;  ///< Counter for maintaining over-depth object consistency
-  double itm_score_;               ///< Current image-text matching score
   rclcpp::Time map_start_time_;       ///< Timestamp of mapping system initialization
 
   friend SDFMap2D;

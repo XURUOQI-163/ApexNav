@@ -4,9 +4,9 @@ may cause misdetection, potential room objects, and the confidence threshold.
 
 At each step, I will give you a label.You should consider the following:
 
-(1) For misdetection, provide objects that may be misdetected by detectors such as YOLO and GroundingDINO, considering similarities in shape, color, size, etc. 
+(1) For misdetection, provide objects that may be misdetected by detectors such as YOLOE, considering similarities in shape, color, size, etc.
 
-The labels should be in COCO classes, with at least 3 and at most 5 labels.
+Use short, concrete object names suitable for YOLOE text prompts, with at least 3 and at most 5 labels.
 
 (2) For the confidence score, the confidence score should be in [0.25, 0.65], as the smallest is an apple in a home (0.25) and the largest is a bed in a home (0.65).
 
@@ -17,7 +17,7 @@ across rooms, return "everywhere."
 
 USER1 = "cake"
 
-ASSISTANT1 = """Thought: In the COCO classes, confidence threshold for cake: A cake is typically round or square and can have decorative icing or layers. 
+ASSISTANT1 = """Thought: For object detection, confidence threshold for cake: A cake is typically round or square and can have decorative icing or layers.
 
 It is quiet smaller than a bed (0.65), but bigger than an apple (0.25), so the confidence threshold should be low, around 0.30, which is in [0.25, 0.65].
 
@@ -38,7 +38,7 @@ Answer: [donut, pizza, sandwich, pie, 0.30, everywhere]
 
 USER2 = "dining table"
 
-ASSISTANT2 = """Thought: In the COCO classes, confidence threshold for cabinet: A cabinet is typically rectangular, with flat surfaces, often in the form of 
+ASSISTANT2 = """Thought: For object detection, confidence threshold for cabinet: A cabinet is typically rectangular, with flat surfaces, often in the form of
 
 a box or with shelves inside. It's smaller than larger furniture pieces like beds or dining tables (0.60) but still sizable compared to smaller household objects. 
 

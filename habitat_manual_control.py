@@ -22,8 +22,6 @@ Author: Zager-Zhang
 
 # Standard library imports
 import argparse
-import gzip
-import json
 import os
 import signal
 from copy import deepcopy
@@ -52,17 +50,17 @@ from habitat.utils.visualizations.utils import (
 )
 
 # ROS message imports
-from plan_env.msg import MultipleMasksWithConfidence
+from plan_env.msg import MultipleMasksWithConfidence, SemanticScore
 
 # Local project imports
 from habitat2ros.habitat_publisher import ROSPublisherNonNode
 from vlm.utils.get_object_utils import get_object
-from vlm.utils.get_itm_message import get_itm_message_cosine
+from vlm.utils.get_clip_similarity import get_clip_similarity
 from llm.answer_reader.answer_reader import read_answer
 from basic_utils.object_point_cloud_utils.object_point_cloud import (
     get_object_point_cloud,
 )
-from vlm.Labels import MP3D_ID_TO_NAME
+from vlm.label_utils import normalize_objectnav_label
 
 
 FORWARD_KEY = "w"
@@ -90,9 +88,9 @@ class HabitatManualNode(Node):
         self.pub_timer = None
 
         # Publishers
-        self.itm_score_pub = self.create_publisher(Float64, "/blip2/cosine_score", qos)
+        self.semantic_score_pub = self.create_publisher(SemanticScore, "/semantic/score", qos)
         self.cld_with_score_pub = self.create_publisher(
-            MultipleMasksWithConfidence, "/detector/clouds_with_scores", qos)
+            MultipleMasksWithConfidence, "/yoloe/clouds_with_scores", qos)
         self.confidence_threshold_pub = self.create_publisher(
             Float64, "/detector/confidence_threshold", qos)
 
@@ -162,16 +160,6 @@ def _parse_dataset_arg():
 
 
 def main(cfg: DictConfig, node: HabitatManualNode) -> None:
-    with gzip.open(
-        "data/datasets/objectnav/mp3d/v1/val/val.json.gz", "rt", encoding="utf-8"
-    ) as f:
-        val_data = json.load(f)
-    category_to_coco = val_data.get("category_to_mp3d_category_id", {})
-    id_to_name = {
-        category_to_coco[cat]: MP3D_ID_TO_NAME[idx]
-        for idx, cat in enumerate(category_to_coco)
-    }
-
     score_list = []
     object_masks_list = []
     label_list = []
@@ -239,9 +227,7 @@ def main(cfg: DictConfig, node: HabitatManualNode) -> None:
 
     label = env.current_episode.object_category
 
-    if label in category_to_coco:
-        coco_id = category_to_coco[label]
-        label = id_to_name.get(coco_id, label)
+    label = normalize_objectnav_label(label, cfg.habitat.dataset.data_path)
 
     llm_answer, room, node.fusion_threshold = read_answer(
         llm_answer_path, llm_response_path, label, llm_client
@@ -285,11 +271,19 @@ def main(cfg: DictConfig, node: HabitatManualNode) -> None:
 
         info = env.get_metrics()
 
-        # Calculate ITM cosine similarity score
-        cosine = get_itm_message_cosine(observations["rgb"], label, room)
+        observations["ros_stamp"] = node.get_clock().now().to_msg()
+        observations["camera_pitch"] = camera_pitch
+        node.ros_pub.habitat_publish_ros_topic(observations)
+        # Calculate CLIP cosine similarity score
+        cosine = get_clip_similarity(observations["rgb"], label, room)
         print(f"Target related room: {room}")
-        print(f"ITM cosine similarity: {cosine:.3f}")
-        node.publish_float64(node.itm_score_pub, cosine)
+        print(f"CLIP cosine similarity: {cosine:.3f}")
+        semantic_msg = SemanticScore()
+        semantic_msg.header.stamp = observations["ros_stamp"]
+        semantic_msg.header.frame_id = "world"
+        semantic_msg.backend = "clip"
+        semantic_msg.score = float(cosine)
+        node.semantic_score_pub.publish(semantic_msg)
 
         # Detect objects in the current observation
         detect_img, score_list, object_masks_list, label_list = get_object(
@@ -308,6 +302,7 @@ def main(cfg: DictConfig, node: HabitatManualNode) -> None:
             cfg, observations, object_masks_list, node
         )
 
+        cld_with_score_msg.header = semantic_msg.header
         cld_with_score_msg.point_clouds = obj_point_cloud_list
         cld_with_score_msg.confidence_scores = score_list
         cld_with_score_msg.label_indices = label_list

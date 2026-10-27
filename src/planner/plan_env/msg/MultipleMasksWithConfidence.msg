@@ -1,4 +1,5 @@
-# MultipleMasksWithConfidence.msg
+# Original RGB acquisition stamp, shared with SemanticScore and depth/pose.
+std_msgs/Header header
 
 
 # Contains multiple masks; each mask is a boolean array

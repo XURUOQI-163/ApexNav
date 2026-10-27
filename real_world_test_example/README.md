@@ -9,9 +9,9 @@ environment and the Habitat simulator before running this example.
 
 ## Quick Start
 
-> **Note:** All 6 processes below must run in separate terminals with the conda environment and ROS2 sourced:
+> **Note:** Use separate terminals for all 6 processes. ROS2 nodes need the simulation environment below; the two model servers use their own Python environment:
 > ```bash
-> conda activate apexnav_ros2
+> source /opt/apexnav_ros2_py312/bin/activate
 > source /opt/ros/jazzy/setup.bash
 > source install/setup.bash
 > ```
@@ -23,43 +23,41 @@ colcon build
 source install/setup.bash
 ```
 
-### Step 1: Run VLM Servers
-Start each server in a separate terminal (4 terminals total):
+### Step 1: Run Visual Services
+Use the separate visual-service environment described in
+[the setup guide](../docs/vision_services.md). Start each server in a separate terminal:
 ```bash
 # Terminal 1
-python -m vlm.detector.grounding_dino --port 12181
+python -m vlm.detector.yoloe --port 12184 --weights data/yoloe-11l-seg.pt
 
 # Terminal 2
-python -m vlm.itm.blip2itm --port 12182
-
-# Terminal 3
-python -m vlm.segmentor.sam --port 12183
-
-# Terminal 4
-python -m vlm.detector.yolov7 --port 12184
+python -m vlm.similarity.clip --port 12182 --model-name ViT-B/32
 ```
+
+The perception node publishes `/yoloe/clouds_with_scores` and `/clip/cosine_score`.
+Rebuild the ROS2 workspace to update the C++ subscribers.
 
 ### Step 2: Launch RViz Visualization
 ```bash
-# Terminal 5
+# Terminal 3
 ros2 launch exploration_manager rviz_traj.launch.py
 ```
 
 ### Step 3: Launch ApexNav Main Algorithm
 ```bash
-# Terminal 6
+# Terminal 4
 ros2 launch exploration_manager exploration_traj.launch.py
 ```
 
 ### Step 4: Run Habitat Simulator
 ```bash
-# Terminal 7
+# Terminal 5
 python habitat_vel_control.py
 ```
 
 ### Step 5: Run Real-world Test Node
 ```bash
-# Terminal 8
+# Terminal 6
 python ./real_world_test_example/real_world_test_habitat.py
 ```
 

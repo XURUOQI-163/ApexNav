@@ -213,10 +213,11 @@ public:
   void stopCallback(const std_msgs::msg::Empty::SharedPtr msg)
   {
     (void)msg;
-    // Immediate emergency stop
-    rclcpp::Time time_now = this->get_clock()->now();
-    double t_stop = (time_now - start_time_).seconds();
-    traj_duration_ = min(t_stop, traj_duration_);
+    // Stop is valid even before the first trajectory (e.g. planning failed).
+    // Do not read its unset duration or subtract its uninitialized clock stamp.
+    receive_traj_ = false;
+    has_target_angle_ = false;
+    vel_cmd_pub_->publish(geometry_msgs::msg::Twist());
   }
 
   void targetAngleCallback(const std_msgs::msg::Float32::SharedPtr msg)

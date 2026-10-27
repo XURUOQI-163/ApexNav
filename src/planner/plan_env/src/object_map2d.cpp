@@ -75,11 +75,11 @@ void ObjectMap2D::setConfidenceThreshold(double val)
  * scores, improving the robustness of the semantic mapping system.
  *
  * @param observation_clouds Vector of point clouds representing observed regions
- * @param itm_score Image-text matching score for context weighting
+ * @param clip_score CLIP cosine similarity for context weighting
  */
 void ObjectMap2D::inputObservationObjectsCloud(
     const vector<pcl::shared_ptr<pcl::PointCloud<pcl::PointXYZ>>> observation_clouds,
-    const double& itm_score)
+    const double& clip_score)
 {
   // Only process observations in fusion mode with observation enabled
   if (fusion_type_ != 1 || !use_observation_)
@@ -128,7 +128,7 @@ void ObjectMap2D::inputObservationObjectsCloud(
       int observation_now = overlap_count;
       double confidence_now = 0.0;  // Negative evidence has zero confidence
       if (label == 0)
-        confidence_now = itm_score;  // Use ITM score for primary label
+        confidence_now = clip_score;  // Use CLIP score for primary label
       int total_now = merged_object.clouds_[label]->points.size();
 
       // Apply confidence fusion algorithm

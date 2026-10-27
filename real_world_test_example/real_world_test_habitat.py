@@ -18,14 +18,14 @@ from omegaconf import DictConfig
 from sensor_msgs.msg import Image
 from nav_msgs.msg import Odometry
 from std_msgs.msg import Float64, String
-from plan_env.msg import MultipleMasksWithConfidence
+from plan_env.msg import MultipleMasksWithConfidence, SemanticScore
 
 current_dir = os.path.dirname(os.path.realpath(__file__))
 parent_dir = os.path.dirname(current_dir)
 sys.path.append(parent_dir)
 
 from vlm.utils.get_object_utils import get_object
-from vlm.utils.get_itm_message import get_itm_message_cosine
+from vlm.utils.get_semantic_similarity import get_semantic_similarity
 from llm.answer_reader.answer_reader import read_answer
 from basic_utils.object_point_cloud_utils.object_point_cloud import (
     get_object_point_cloud,
@@ -55,6 +55,7 @@ class RealWorldNode(Node):
     def __init__(self, cfg):
         super().__init__('real_world_node')
         self.config = cfg
+        self.semantic_backend = cfg.get("semantic_model", "clip")
 
         self.bridge = CvBridge()
 
@@ -80,28 +81,26 @@ class RealWorldNode(Node):
         # Configure publishers
         self.confidence_threshold_pub_ = self.create_publisher(
             Float64, "/detector/confidence_threshold", qos)
-        self.itm_score_pub_ = self.create_publisher(
-            Float64, "/blip2/cosine_score", qos)
+        self.semantic_score_pub_ = self.create_publisher(
+            SemanticScore, "/semantic/score", qos)
         self.cld_with_score_pub_ = self.create_publisher(
-            MultipleMasksWithConfidence, "/detector/clouds_with_scores", qos)
+            MultipleMasksWithConfidence, "/yoloe/clouds_with_scores", qos)
         self.detect_img_pub_ = self.create_publisher(
             Image, "/detector/detect_img", qos)
 
         # Initialize detector
         # Synchronize RGB, depth and sensor_pose topics
-        self.sync_detect = message_filters.ApproximateTimeSynchronizer(
+        self.sync_detect = message_filters.TimeSynchronizer(
             [self.rgb_sub_, self.depth_sub_, self.sensor_pose_sub_],
             queue_size=5,
-            slop=0.01,
         )
         self.sync_detect.registerCallback(self.sync_detect_callback)
 
         # Initialize value module
         # (uses synchronized RGB/depth/sensor_pose messages)
-        self.sync_value = message_filters.ApproximateTimeSynchronizer(
+        self.sync_value = message_filters.TimeSynchronizer(
             [self.rgb_sub_, self.depth_sub_, self.sensor_pose_sub_],
             queue_size=5,
-            slop=0.01,
         )
         self.sync_value.registerCallback(self.sync_value_callback)
 
@@ -118,7 +117,7 @@ class RealWorldNode(Node):
         llm_cfg = self.config.llm
         self.llm_answer_path = llm_cfg.llm_answer_path
         self.llm_response_path = llm_cfg.llm_response_path
-        self.llm_client = llm_cfg.llm_client.llm_client
+        self.llm_client = llm_cfg.llm_client
 
         # Label will be provided via ROS topic `/detector/label` (std_msgs/String)
         # Initialize empty/defaults; actual values will be set in `label_callback`.
@@ -154,6 +153,7 @@ class RealWorldNode(Node):
             depth_cv = np.expand_dims(transform_depth_img, axis=-1)
 
             cld_with_score_msg = MultipleMasksWithConfidence()
+            cld_with_score_msg.header = rgb_msg.header
             cld_with_score_msg.point_clouds = []
             cld_with_score_msg.confidence_scores = []
             cld_with_score_msg.label_indices = []
@@ -197,6 +197,8 @@ class RealWorldNode(Node):
             self.processing_detect = False
 
     def sync_value_callback(self, rgb_msg, depth_msg, sensor_pose_msg):
+        if self.label is None or self.room is None:
+            return
         # If a value run is already in progress, skip this invocation.
         if self.processing_value:
             return
@@ -211,11 +213,17 @@ class RealWorldNode(Node):
 
             rgb_cv = self.bridge.imgmsg_to_cv2(rgb_msg, desired_encoding="rgb8")
 
-            cosine = get_itm_message_cosine(rgb_cv, self.label, self.room)
-            self.get_logger().info(f"value: Computed cosine score: {cosine:.3f}")
-            itm_score_msg = Float64()
-            itm_score_msg.data = float(cosine)
-            self.itm_score_pub_.publish(itm_score_msg)
+            cosine = get_semantic_similarity(rgb_cv, self.label, self.room, self.semantic_backend)
+            score_msg = SemanticScore()
+            score_msg.header = rgb_msg.header  # acquisition stamp, unchanged by HTTP latency
+            score_msg.backend = self.semantic_backend
+            score_msg.score = float(cosine)
+            self.semantic_score_pub_.publish(score_msg)
+            age = (self.get_clock().now().nanoseconds -
+                   (stamp.sec * 1_000_000_000 + stamp.nanosec)) / 1e9
+            self.get_logger().info(
+                f"semantic[{self.semantic_backend}]: raw cosine={cosine:.4f}, "
+                f"frame={stamp.sec}.{stamp.nanosec:09d}, age={age:.3f}s")
         except Exception as e:
             self.get_logger().error(f"value: Error in synchronized processing: {e}")
         finally:
@@ -234,11 +242,12 @@ class RealWorldNode(Node):
                 self.llm_answer, self.room, self.fusion_score = read_answer(
                     self.llm_answer_path, self.llm_response_path, self.label, self.llm_client
                 )
-            except Exception:
-                # Non-fatal: proceed without LLM answer
+            except Exception as exc:
+                self.get_logger().error(f"Failed to read target context: {exc}")
+                # Keep scene guidance usable without related-object hints.
                 self.llm_answer = []
-                self.room = None
-                self.fusion_score = 0.0
+                self.room = "everywhere"
+                self.fusion_score = 0.5
         except Exception as e:
             self.get_logger().error(f"label_callback: Error processing label message: {e}")
 
@@ -252,8 +261,10 @@ class RealWorldNode(Node):
             self.get_logger().error(f"odom: Error processing Odometry: {e}")
 
     def publish_confidence_threshold(self):
+        if self.label is None or self.room is None:
+            return
         confidence_threshold_msg = Float64()
-        confidence_threshold_msg.data = 0.5
+        confidence_threshold_msg.data = float(self.fusion_score)
         self.confidence_threshold_pub_.publish(confidence_threshold_msg)
 
     def run(self):
