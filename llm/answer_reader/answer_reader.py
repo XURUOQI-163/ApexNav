@@ -1,41 +1,60 @@
+"""Read text priors, isolating cloud Qwen answers from legacy prebuilt caches."""
+import ast
+import hashlib
+import json
+import math
+from pathlib import Path
+
 from llm.answer import get_answer
 
+
+def validate_answer(answer):
+    if not isinstance(answer, list) or len(answer) < 2:
+        raise ValueError('LLM answer must contain object names, confidence and room.')
+    objects, score, room = answer[:-2], answer[-2], answer[-1]
+    if any(not isinstance(x, str) or not x.strip() or '\n' in x for x in objects):
+        raise ValueError('LLM similar objects must be nonempty single-line strings.')
+    if not isinstance(room, str) or not room.strip() or '\n' in room:
+        raise ValueError('LLM room must be a nonempty single-line string.')
+    if isinstance(score, bool) or not isinstance(score, (int, float)) or not math.isfinite(score) or not .25 <= score <= .65:
+        raise ValueError('LLM confidence must be finite and between 0.25 and 0.65.')
+    return objects, room, float(score)
+
+
+def cache_paths(answer_path, response_path, client):
+    paths = (Path(answer_path), Path(response_path))
+    if client.llm_client == 'qwen':
+        from llm.client.qwen_answer import QWEN_PROMPT, qwen_settings
+        identity = json.dumps([*qwen_settings(client.qwen), QWEN_PROMPT], ensure_ascii=False)
+        tag = hashlib.sha256(identity.encode()).hexdigest()[:16]
+        paths = tuple(p.with_name(f'{p.stem}.qwen-{tag}{p.suffix}') for p in paths)
+    return paths
+
+
 def read_answer(llm_answer_path, llm_response_path, label, llm_client):
-    label_existing = False
-
-    with open(llm_answer_path, "a+") as f:
-        f.seek(0)
-        lines = f.readlines()
-
-        for line in lines:
-            if line.startswith(f"{label}:"):
-                label_existing = True
-                llm_answer = eval(line[len(label) + 1 :].strip())
-                print(f"Already have Answer for {label}: {llm_answer}")
-                break
-
-        if not label_existing:
-            llm_answer, response = get_answer(prompt=label, client=llm_client)
-            print(llm_answer)
-            f.write(f"\n{label}: {llm_answer}")
-            print(f"New Answer for {label}: {llm_answer}")
-            # Write the response to the llm_response_path file
-            with open(llm_response_path, "a+") as response_file:
-                response_file.write(
-                    f"\n{label}: {response}"
-                )  # Write the label and its corresponding response to the file
-                print(f"Response saved to {llm_response_path}: {response}")
-                
-    if isinstance(llm_answer[-1], str):
-        room = llm_answer[-1]
-        llm_answer.pop()
-    else:
-        raise ValueError("Room answer is not correct!!!!")
-
-    if isinstance(llm_answer[-1], float):
-        fusion_score = llm_answer[-1]
-        llm_answer.pop()
-    else:
-        raise ValueError("Score answer is not correct!!!!")
-    
-    return llm_answer, room, fusion_score
+    policy = getattr(llm_client, 'cache_policy', 'read_write')
+    if policy not in ('read_write', 'refresh', 'off'):
+        raise ValueError('LLM cache_policy must be read_write, refresh or off.')
+    answer_path, response_path = cache_paths(llm_answer_path, llm_response_path, llm_client)
+    if policy == 'read_write' and answer_path.exists():
+        # Latest entry wins after an explicit refresh. literal_eval never executes code.
+        for line in reversed(answer_path.read_text(encoding='utf-8').splitlines()):
+            if line.startswith(f'{label}:'):
+                result = validate_answer(ast.literal_eval(line[len(label)+1:].strip()))
+                print(f'[LLM {llm_client.llm_client}] cache hit: {label} ({answer_path})', flush=True)
+                return result
+    if llm_client.llm_client == 'none':
+        return [], 'everywhere', 0.5
+    print(f'[LLM {llm_client.llm_client}] requesting context: {label}', flush=True)
+    answer, response = get_answer(prompt=label, client=llm_client)
+    result = validate_answer(answer)  # Never persist malformed responses.
+    if policy != 'off':
+        for path in (answer_path, response_path):
+            path.parent.mkdir(parents=True, exist_ok=True)
+        with answer_path.open('a', encoding='utf-8') as output:
+            output.write(f'\n{label}: {answer!r}\n')
+        with response_path.open('a', encoding='utf-8') as output:
+            output.write(json.dumps({'target': label, 'response': response}, ensure_ascii=False)+'\n')
+        print(f'[LLM {llm_client.llm_client}] cache saved: {answer_path}', flush=True)
+    print(f'[LLM context] similar={result[0]} room={result[1]} threshold={result[2]}', flush=True)
+    return result

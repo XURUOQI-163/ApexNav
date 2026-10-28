@@ -18,7 +18,13 @@ int main() {
   assert(!c.addScore(40, 40, .2)); // Score before depth.
   auto early = c.addObservation(40, 41, {4, 44});
   assert(early && early->observation.cell == 44 && early->score == .2);
-  assert(!c.addScore(20, 42, .8)); // Older than last fused result.
+  // Independent semantic inference may finish many newer frames before YOLO
+  // returns an older detection. Keep its original geometry until age/capacity.
+  auto detection_geometry=c.observation(10,42);
+  assert(detection_geometry && detection_geometry->cell == 11);
+  auto older=c.addScore(20,42,.8);
+  assert(older && older->observation.cell==22 && older->score==.8);
+  assert(!c.addScore(20,43,.9));
   assert(!c.observation(10, 200)); // Late detection cannot revive expired geometry.
   assert(!c.addObservation(50, 200, {5, 55})); // Expired.
   assert(!c.addScore(50, 200, .8));

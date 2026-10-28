@@ -35,6 +35,15 @@ PlanningVisualization::PlanningVisualization(rclcpp::Node::SharedPtr node)
   last_frontier_num_ = 0;
 }
 
+void PlanningVisualization::clearAll()
+{
+  visualization_msgs::msg::Marker clear;
+  clear.header.frame_id = "world";
+  clear.header.stamp = node_->get_clock()->now();
+  clear.action = visualization_msgs::msg::Marker::DELETEALL;
+  for (const auto& pub : pubs_) pub->publish(clear);
+}
+
 void PlanningVisualization::fillBasicInfo(visualization_msgs::msg::Marker& mk,
     const Eigen::Vector3d& scale, const Eigen::Vector4d& color, const string& ns, const int& id,
     const int& shape)

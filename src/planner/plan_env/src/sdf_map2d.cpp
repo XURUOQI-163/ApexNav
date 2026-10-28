@@ -15,6 +15,7 @@
 #include <plan_env/map_ros.h>
 #include <plan_env/object_map2d.h>
 #include <plan_env/value_map2d.h>
+#include <plan_env/frontier_map2d.h>
 #include <unordered_map>
 
 namespace apexnav_planner {
@@ -162,6 +163,7 @@ void SDFMap2D::initMap(rclcpp::Node::SharedPtr node)
   // Initialize ROS2 components and raycaster
   object_map2d_.reset(new ObjectMap2D(this, node));
   value_map_.reset(new ValueMap(this, node));
+  frontier_map2d_.reset(new FrontierMap2D(this, node));
   map_ros_->setMap(this);
   map_ros_->setNode(node);
   map_ros_->init();

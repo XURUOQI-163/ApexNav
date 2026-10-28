@@ -3,6 +3,7 @@
 
 // ROS2 core and message handling
 #include <rclcpp/rclcpp.hpp>
+#include <cstdio>
 #include <message_filters/subscriber.h>
 #include <message_filters/sync_policies/approximate_time.h>
 #include <message_filters/sync_policies/exact_time.h>
@@ -11,10 +12,12 @@
 // Custom messages and mapping components
 #include <plan_env/msg/multiple_masks_with_confidence.hpp>
 #include <plan_env/msg/semantic_score.hpp>
+#include <plan_env/msg/frontier_scan.hpp>
 #include <plan_env/semantic_observation_cache.h>
 #include <plan_env/sdf_map2d.h>
 #include <plan_env/object_map2d.h>
 #include <plan_env/value_map2d.h>
+#include <plan_env/frontier_map2d.h>
 
 // OpenCV for image processing
 #include <cv_bridge/cv_bridge.hpp>
@@ -25,6 +28,7 @@
 #include <sensor_msgs/msg/image.hpp>
 #include <nav_msgs/msg/odometry.hpp>
 #include <visualization_msgs/msg/marker.hpp>
+#include <visualization_msgs/msg/marker_array.hpp>
 #include <std_msgs/msg/float64.hpp>
 
 // PCL for point cloud processing
@@ -63,6 +67,7 @@ public:
   void setMap(SDFMap2D* map);
   void setNode(rclcpp::Node::SharedPtr node);
   void init();
+  void clearVisualization();
 
 private:
   // ROS2 callback functions
@@ -75,7 +80,7 @@ private:
   struct SemanticObservation {
     Eigen::Vector2d camera_pos;
     double camera_yaw;
-    std::vector<Eigen::Vector2i> free_grids;
+
     Eigen::Vector3d camera_pos3;
     Eigen::Quaterniond camera_q;
     PointCloud3D::Ptr depth_cloud;
@@ -87,6 +92,7 @@ private:
   void applyObjectObservation(const std::shared_ptr<SemanticObservation>& observation);
   SemanticCache semantic_cache_;
   std::string semantic_backend_;
+  int64_t last_depth_stamp_ = 0;
   void applySemanticMatch(const std::optional<SemanticCache::Match>& match);
   void visCallback();
 
@@ -100,6 +106,11 @@ private:
   void publishESDFMap();
   void publishValueMap();
   void publishConfidenceMap();
+  void publishFrontierLabels();
+  void publishFrontierGeometry();
+  rclcpp::Publisher<plan_env::msg::FrontierScan>::SharedPtr frontier_scan_pub_;
+  double frontier_color_min_ = .1, frontier_color_max_ = .35;
+  rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr frontier_geometry_pub_;
   void publishUpdateRange();
   void publishPointCloud(
       const rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr& pub,
@@ -146,6 +157,7 @@ private:
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr over_depth_object_cloud_pub_;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr value_map_pub_;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr confidence_map_pub_;
+  rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr frontier_labels_pub_;
 
   // ROS2 subscribers for sensor data
   rclcpp::Subscription<plan_env::msg::MultipleMasksWithConfidence>::SharedPtr detected_object_cloud_sub_;
@@ -388,34 +400,13 @@ inline void MapROS::publishFree()
 
 inline void MapROS::publishConfidenceMap()
 {
-  double value;
   pcl::PointCloud<pcl::PointXYZI> cloud;
-  pcl::PointXYZI pt;
-
-  const double min_value = 0.0;
-  const double max_value = 1.0;
-
-  Eigen::Vector2i min_cut = map_->md_->update_min_;
-  Eigen::Vector2i max_cut = map_->md_->update_max_;
-  map_->boundIndex(min_cut);
-  map_->boundIndex(max_cut);
-
-  for (int x = min_cut(0); x <= max_cut(0); ++x) {
-    for (int y = min_cut(1); y <= max_cut(1); ++y) {
-      value = map_->value_map_->getConfidence(Eigen::Vector2i(x, y));
-      if (value > 1e-3) {
-        Eigen::Vector2d pos_2d;
-        map_->indexToPos(Eigen::Vector2i(x, y), pos_2d);
-        // Normalize confidence value for visualization
-        value = std::min(value, max_value);
-        value = std::max(value, min_value);
-        pt.x = pos_2d(0);
-        pt.y = pos_2d(1);
-        pt.z = 0.08;
-        pt.intensity = (value - min_value) / (max_value - min_value);
-        cloud.push_back(pt);
-      }
-    }
+  for (const auto& entry : map_->value_map_->nodes()) {
+    pcl::PointXYZI pt;
+    const auto& node = entry.second;
+    pt.x = node.geometry.x; pt.y = node.geometry.y; pt.z = 0.16;
+    pt.intensity = node.confidence;
+    cloud.push_back(pt);
   }
 
   cloud.width = cloud.points.size();
@@ -424,47 +415,20 @@ inline void MapROS::publishConfidenceMap()
   cloud.header.frame_id = frame_id_;
   sensor_msgs::msg::PointCloud2 cloud_msg;
   pcl::toROSMsg(cloud, cloud_msg);
+  cloud_msg.header.stamp = node_->get_clock()->now();
   confidence_map_pub_->publish(cloud_msg);
 }
 
 inline void MapROS::publishValueMap()
 {
-  double value;
   pcl::PointCloud<pcl::PointXYZI> cloud;
-  pcl::PointXYZI pt;
-
-  const double min_value = 0.0;
-  const double max_value = 1.0;
-
-  Eigen::Vector2i min_cut = map_->md_->update_min_;
-  Eigen::Vector2i max_cut = map_->md_->update_max_;
-  map_->boundIndex(min_cut);
-  map_->boundIndex(max_cut);
-
-  for (int x = min_cut(0); x <= max_cut(0); ++x) {
-    for (int y = min_cut(1); y <= max_cut(1); ++y) {
-      value = map_->value_map_->getValue(Eigen::Vector2i(x, y));
-      if (value > 1e-3) {
-        // Only show values in free space (not inflated occupied or unknown)
-        if (map_->md_->occupancy_buffer_inflate_[map_->toAddress(x, y)] == 1)
-          continue;
-        if (map_->md_->occupancy_buffer_[map_->toAddress(x, y)] < map_->mp_->clamp_min_log_ - 1e-3)
-          continue;
-        if (map_->md_->occupancy_buffer_[map_->toAddress(x, y)] > map_->mp_->min_occupancy_log_)
-          continue;
-
-        Eigen::Vector2d pos_2d;
-        map_->indexToPos(Eigen::Vector2i(x, y), pos_2d);
-        // Normalize value for visualization
-        value = std::min(value, max_value);
-        value = std::max(value, min_value);
-        pt.x = pos_2d(0);
-        pt.y = pos_2d(1);
-        pt.z = 0.08;
-        pt.intensity = (value - min_value) / (max_value - min_value);
-        cloud.push_back(pt);
-      }
-    }
+  for (const auto& entry : map_->value_map_->nodes()) {
+    const auto& node = entry.second;
+    if (node.confidence <= 0.) continue;
+    pcl::PointXYZI pt;
+    pt.x = node.geometry.x; pt.y = node.geometry.y; pt.z = 0.16;
+    pt.intensity = node.value;  // Raw fused value, including valid negative scores.
+    cloud.push_back(pt);
   }
 
   cloud.width = cloud.points.size();
@@ -473,7 +437,38 @@ inline void MapROS::publishValueMap()
   cloud.header.frame_id = frame_id_;
   sensor_msgs::msg::PointCloud2 cloud_msg;
   pcl::toROSMsg(cloud, cloud_msg);
+  cloud_msg.header.stamp = node_->get_clock()->now();
   value_map_pub_->publish(cloud_msg);
+}
+
+inline void MapROS::publishFrontierLabels()
+{
+  visualization_msgs::msg::MarkerArray markers;
+  visualization_msgs::msg::Marker clear;
+  clear.header.frame_id = frame_id_;
+  clear.header.stamp = node_->get_clock()->now();
+  clear.action = visualization_msgs::msg::Marker::DELETEALL;
+  markers.markers.push_back(clear);
+  for (const auto& entry : map_->value_map_->nodes()) {
+    const auto& node = entry.second;
+    visualization_msgs::msg::Marker label;
+    label.header = clear.header;
+    label.ns = "frontier_semantics"; label.id = entry.first;
+    label.type = visualization_msgs::msg::Marker::TEXT_VIEW_FACING;
+    label.action = visualization_msgs::msg::Marker::ADD;
+    label.pose.position.x = node.geometry.x; label.pose.position.y = node.geometry.y;
+    label.pose.position.z = .45; label.pose.orientation.w = 1.;
+    label.scale.z = .16;
+    label.color.r = node.geometry.active ? .35f : .5f;
+    label.color.g = .15f; label.color.b = .6f; label.color.a = 1.;
+    char text[100];
+    if (node.confidence > 0.)
+      std::snprintf(text,sizeof(text),"F%d %.3f (%zu/%zu)",entry.first,node.value,node.scored_cells,node.geometry.cells.size());
+    else std::snprintf(text,sizeof(text),"F%d unscored",entry.first);
+    label.text = text;
+    markers.markers.push_back(label);
+  }
+  frontier_labels_pub_->publish(markers);
 }
 
 inline void MapROS::publishPointCloud(

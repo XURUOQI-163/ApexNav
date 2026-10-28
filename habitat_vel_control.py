@@ -7,6 +7,7 @@ velocity integration loop. YOLOE and CLIP model servers remain external.
 import json
 import math
 import multiprocessing
+import signal
 import time
 
 import habitat
@@ -20,12 +21,14 @@ from habitat.sims.habitat_simulator.actions import HabitatSimActions
 from habitat_sim.utils import common as utils
 from omegaconf import OmegaConf
 from rclpy.node import Node
+from rclpy.signals import SignalHandlerOptions
 from std_msgs.msg import Empty, Int32, String
 
 from basic_utils.velocity_command import VelocityCommand
 from habitat2ros.habitat_publisher import ROSPublisherNonNode
+from habitat2ros.episode_reset import reset_episode
 from params import HABITAT_STATE
-from vlm.label_utils import normalize_objectnav_label
+from vlm.label_utils import resolve_navigation_target
 
 
 class HabitatVelControlNode(Node):
@@ -76,7 +79,7 @@ def _run_perception(config, stop_event):
             rclpy.shutdown()
 
 
-def run_simulation(cfg, node, perception_process):
+def run_simulation(cfg, node, perception_process, target_description=None):
     cfg = patch_config(cfg)
     fps = float(cfg.continuous.control_hz)
     scan_seconds = float(cfg.continuous.initial_scan_seconds)
@@ -103,7 +106,8 @@ def run_simulation(cfg, node, perception_process):
         env.current_episode = env.episodes[episode_index]
         observations = env.reset()
         episode = env.current_episode
-        label = normalize_objectnav_label(episode.object_category, cfg.habitat.dataset.data_path)
+        label = resolve_navigation_target(episode.object_category, cfg.habitat.dataset.data_path,
+                                          target_description)
         print(f'Continuous mode: index={episode_index}, episode_id={episode.episode_id}, '
               f'scene={episode.scene_id}, target={label}', flush=True)
 
@@ -162,20 +166,31 @@ def run_simulation(cfg, node, perception_process):
                 node.get_logger().info(f'Finding {label}: v={actual_speed:.3f} m/s, w={angular:.3f} rad/s, tick={frames}')
             time.sleep(max(0., time_step - (time.monotonic() - loop_start)))
 
-        metrics = env.get_metrics()
-        summary = {key: metrics[key] for key in ['success','spl','soft_spl','distance_to_goal','collisions'] if key in metrics}
-        print('Continuous episode metrics: ' + json.dumps(summary, default=float), flush=True)
-        print('Continuous ticks and time budgets differ from discrete action evaluation.', flush=True)
+        if target_description is not None:
+            print(f'Custom-target simulation ended: target={label}, ticks={frames}, '
+                  f'sim_time={elapsed_sim_time:.2f}s', flush=True)
+        else:
+            metrics = env.get_metrics()
+            summary = {key: metrics[key] for key in ['success','spl','soft_spl','distance_to_goal','collisions'] if key in metrics}
+            print('Continuous episode metrics: ' + json.dumps(summary, default=float), flush=True)
+            print('Continuous ticks and time budgets differ from discrete action evaluation.', flush=True)
 
 
-def run_continuous(cfg):
+def run_continuous(cfg, target_description=None):
     """Own the simulator ROS node and the automatically managed visual bridge."""
-    rclpy.init()
+    # Keep ROS alive through Ctrl+C so finally can request and acknowledge reset.
+    rclpy.init(signal_handler_options=SignalHandlerOptions.NO)
+    signal.signal(signal.SIGINT, signal.default_int_handler)
+    signal.signal(signal.SIGTERM, signal.default_int_handler)
     node = None
     process = None
     stop_event = None
     try:
         node = HabitatVelControlNode(command_timeout=float(cfg.continuous.command_timeout))
+        reset_episode(node, continuous=True)
+        # Discard old action/velocity callbacks drained during the handshake.
+        node.command.stop()
+        node.stop_requested = False
         node.wait_for_controller()
         # Resolve the selected dataset configuration before passing it to the
         # visual bridge, including its matching LLM cache and camera parameters.
@@ -186,7 +201,7 @@ def run_continuous(cfg):
             target=_run_perception, args=(OmegaConf.to_container(cfg, resolve=True), stop_event),
             name='apexnav_continuous_perception')
         process.start()
-        run_simulation(cfg, node, process)
+        run_simulation(cfg, node, process, target_description=target_description)
     except KeyboardInterrupt:
         print('Continuous simulation interrupted.', flush=True)
     finally:
@@ -194,8 +209,6 @@ def run_continuous(cfg):
             node.command.stop()
             if rclpy.ok():
                 node.stop_pub.publish(Empty())
-                node.state_pub.publish(Int32(data=HABITAT_STATE.EPISODE_FINISH))
-                rclpy.spin_once(node, timeout_sec=.1)
         if process is not None:
             stop_event.set()
             # Let an in-flight HTTP inference finish before shutting down ROS.
@@ -207,6 +220,13 @@ def run_continuous(cfg):
                 process.kill()
                 process.join(timeout=2.)
         if node is not None:
+            # Stop the producer before clearing caches: an in-flight inference
+            # must not publish into the next episode's planner state.
+            if rclpy.ok():
+                try:
+                    reset_episode(node, continuous=True, timeout=3.)
+                except Exception as exc:
+                    node.get_logger().warning(f'Exit reset incomplete: {exc}; next startup will retry')
             node.destroy_node()
         if rclpy.ok():
             rclpy.shutdown()

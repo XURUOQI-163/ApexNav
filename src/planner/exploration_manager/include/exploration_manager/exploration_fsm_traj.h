@@ -12,6 +12,7 @@
 
 // ROS2 core
 #include <rclcpp/rclcpp.hpp>
+#include <std_srvs/srv/trigger.hpp>
 
 // ROS2 message types
 #include <geometry_msgs/msg/pose_stamped.hpp>
@@ -159,6 +160,9 @@ private:
   void publishRobotMarker();
   void visualize();
   void clearVisMarker();
+  void resetEpisode();
+  rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr reset_service_;
+  rclcpp::Time episode_start_time_{0, 0, RCL_ROS_TIME};
 
   /* ROS2 callbacks */
   void FSMCallback();

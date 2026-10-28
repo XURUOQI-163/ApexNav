@@ -20,6 +20,7 @@
 #include <pcl/search/kdtree.h>
 
 #include <vector>
+#include <algorithm>
 #include <chrono>
 #include <functional>
 
@@ -162,9 +163,23 @@ void MapROS::init()
       "/grid_map/all_object_cloud", 10);
   over_depth_object_cloud_pub_ = node_->create_publisher<sensor_msgs::msg::PointCloud2>(
       "/grid_map/over_depth_object_cloud", 10);
-  value_map_pub_ = node_->create_publisher<sensor_msgs::msg::PointCloud2>("/grid_map/value_map", 10);
+  value_map_pub_ = node_->create_publisher<sensor_msgs::msg::PointCloud2>("/frontier_semantics/score", 10);
   confidence_map_pub_ = node_->create_publisher<sensor_msgs::msg::PointCloud2>(
-      "/grid_map/confidence_map", 10);
+      "/frontier_semantics/confidence", 10);
+  frontier_labels_pub_ = node_->create_publisher<visualization_msgs::msg::MarkerArray>(
+      "/frontier_semantics/labels", 10);
+  frontier_scan_pub_ = node_->create_publisher<plan_env::msg::FrontierScan>("/frontier_semantics/scan", 20);
+  frontier_geometry_pub_ = node_->create_publisher<visualization_msgs::msg::MarkerArray>(
+      "/frontier_semantics/markers", 10);
+  if (!node_->has_parameter("frontier_visualization/score_min"))
+    node_->declare_parameter("frontier_visualization/score_min", .1);
+  if (!node_->has_parameter("frontier_visualization/score_max"))
+    node_->declare_parameter("frontier_visualization/score_max", .35);
+  frontier_color_min_ = node_->get_parameter("frontier_visualization/score_min").as_double();
+  frontier_color_max_ = node_->get_parameter("frontier_visualization/score_max").as_double();
+  if (!std::isfinite(frontier_color_min_) || !std::isfinite(frontier_color_max_) ||
+      frontier_color_min_ >= frontier_color_max_)
+    throw std::invalid_argument("frontier_visualization requires finite score_min < score_max");
 
   // Setup subscribers for object detection and CLIP scores
   detected_object_cloud_sub_ = node_->create_subscription<plan_env::msg::MultipleMasksWithConfidence>(
@@ -200,10 +215,35 @@ void MapROS::init()
   semantic_cache_ = SemanticCache(capacity, static_cast<int64_t>(max_age * 1e9),
                                   map_start_time_.nanoseconds());
   semantic_backend_.clear();
+  clearVisualization();
+}
+
+void MapROS::clearVisualization()
+{
+  // Publish on every idle visualization tick as well, so subscribers discovering
+  // the reconstructed map publishers late still receive the empty scene.
+  PointCloud3D::Ptr empty(new PointCloud3D());
+  for (const auto& pub : {occupied_pub_, unknown_pub_, free_pub_, occupied_inflate_pub_,
+                         object_grid_pub_, esdf_pub_, depth_cloud_pub_, filtered_depth_cloud_pub_,
+                         filtered_object_cloud_pub_, all_object_cloud_pub_, over_depth_object_cloud_pub_})
+    publishPointCloud(pub, empty);
+  publishValueMap();
+  publishConfidenceMap();
+  publishFrontierLabels();
+  publishFrontierGeometry();
+  visualization_msgs::msg::Marker clear;
+  clear.header.frame_id = frame_id_;
+  clear.header.stamp = node_->get_clock()->now();
+  clear.action = visualization_msgs::msg::Marker::DELETEALL;
+  update_range_pub_->publish(clear);
 }
 
 void MapROS::visCallback()
 {
+  if (last_depth_stamp_ == 0) {
+    clearVisualization();
+    return;
+  }
   // Publish all visualization topics
   publishOccupied();
   publishInfOccupied();
@@ -211,9 +251,72 @@ void MapROS::visCallback()
   publishUnknown();
   publishFree();
   publishValueMap();
-  // publishConfidenceMap();
+  publishConfidenceMap();
+  publishFrontierLabels();
+  publishFrontierGeometry();
   publishESDFMap();
   // publishUpdateRange();
+}
+
+void MapROS::publishFrontierGeometry()
+{
+  // One current snapshot: clusters supply geometry, sparse nodes supply their
+  // fused score. No extra grid semantics or historical markers are stored.
+  visualization_msgs::msg::MarkerArray result;
+  visualization_msgs::msg::Marker clear;
+  clear.header.frame_id = frame_id_;
+  clear.header.stamp = node_->get_clock()->now();
+  clear.action = visualization_msgs::msg::Marker::DELETEALL;
+  result.markers.push_back(clear);
+  const auto& nodes = map_->value_map_->nodes();
+  auto append = [&](const list<Frontier2D>& frontiers, bool active) {
+    visualization_msgs::msg::Marker boundary, centers;
+    boundary.header = centers.header = clear.header;
+    boundary.ns = active ? "active_boundaries" : "dormant_boundaries";
+    centers.ns = active ? "active_centers" : "dormant_centers";
+    boundary.type = visualization_msgs::msg::Marker::CUBE_LIST;
+    centers.type = active ? visualization_msgs::msg::Marker::SPHERE_LIST :
+                            visualization_msgs::msg::Marker::CUBE_LIST;
+    boundary.action = centers.action = visualization_msgs::msg::Marker::ADD;
+    boundary.pose.orientation.w = centers.pose.orientation.w = 1.;
+    boundary.scale.x = boundary.scale.y = map_->getResolution() * 1.3;
+    boundary.scale.z = .06;
+    centers.scale.x = centers.scale.y = centers.scale.z = active ? .28 : .20;
+    boundary.color.a = centers.color.a = 1.;
+    for (const auto& f : frontiers) {
+      const auto it = nodes.find(f.id_);
+      auto semanticColor = [&](double value,double confidence) {
+      std_msgs::msg::ColorRGBA color;
+      color.r = color.g = color.b = .45f;  // Unscored is visible, not score zero.
+      color.a = 1.;
+      if (confidence > 0.) {
+        const double t = std::clamp((value-frontier_color_min_) /
+                                   (frontier_color_max_-frontier_color_min_), 0., 1.);
+        color.r = 1. - .45*t;
+        color.g = .8 - .78*t;
+        color.b = .75 - .73*t;
+      }
+      return color;
+      };
+      const auto color=it==nodes.end()?semanticColor(0.,0.):semanticColor(it->second.value,it->second.confidence);
+      geometry_msgs::msg::Point p;
+      for (const auto& cell : f.cells_) {
+        p.x = cell.x(); p.y = cell.y(); p.z = .22;
+        Eigen::Vector2i idx;map_->posToIndex(cell,idx);
+        const auto& semantic=map_->value_map_->cellAt(map_->toAddress(idx));
+        boundary.points.push_back(p);
+        boundary.colors.push_back(semanticColor(semantic.value,semantic.confidence));
+      }
+      p.x = f.average_.x(); p.y = f.average_.y(); p.z = .36;
+      centers.points.push_back(p); centers.colors.push_back(color);
+    }
+    // DELETEALL already removes empty lists and disappeared clusters.
+    if (!boundary.points.empty()) result.markers.push_back(std::move(boundary));
+    if (!centers.points.empty()) result.markers.push_back(std::move(centers));
+  };
+  append(map_->frontier_map2d_->activeFrontiers(), true);
+  append(map_->frontier_map2d_->dormantFrontiers(), false);
+  frontier_geometry_pub_->publish(result);
 }
 
 void MapROS::semanticScoreCallback(const plan_env::msg::SemanticScore::SharedPtr msg)
@@ -222,6 +325,7 @@ void MapROS::semanticScoreCallback(const plan_env::msg::SemanticScore::SharedPtr
   const int64_t now = node_->get_clock()->now().nanoseconds();
   if (stamp <= map_start_time_.nanoseconds() || msg->header.frame_id != frame_id_ ||
       (msg->backend != "clip" && msg->backend != "blip2") ||
+      stamp > now || msg->cell_ids.size() != msg->weights.size() ||
       !std::isfinite(msg->score) || msg->score < -1.0 || msg->score > 1.0)
     return;
   if (semantic_backend_.empty()) semantic_backend_ = msg->backend;
@@ -230,6 +334,13 @@ void MapROS::semanticScoreCallback(const plan_env::msg::SemanticScore::SharedPtr
         "[Semantic] Mixed backends rejected; restart planner when switching models");
     return;
   }
+  std::vector<CellProjection> projections;
+  projections.reserve(msg->cell_ids.size());
+  for (size_t i=0;i<msg->cell_ids.size();++i)
+    projections.push_back({msg->cell_ids[i],msg->weights[i]});
+  const size_t updated=map_->value_map_->fuse(projections,stamp,msg->score);
+  RCLCPP_DEBUG(node_->get_logger(), "[Semantic] cells stamp=%lld score=%.4f projected=%zu updated=%zu",
+      static_cast<long long>(stamp),msg->score,projections.size(),updated);
   applySemanticMatch(semantic_cache_.addScore(stamp, now, msg->score));
   RCLCPP_INFO_THROTTLE(node_->get_logger(), *node_->get_clock(), 5000,
       "[Semantic] backend=%s age=%.3fs cached=%zu discarded=%zu",
@@ -240,14 +351,8 @@ void MapROS::semanticScoreCallback(const plan_env::msg::SemanticScore::SharedPtr
 void MapROS::applySemanticMatch(const std::optional<SemanticCache::Match>& match)
 {
   if (!match) return;
-  const auto& observation = *match->observation;
-  map_->value_map_->updateValueMap(observation.camera_pos, observation.camera_yaw,
-                                  observation.free_grids, match->score);
   match->observation->score = match->score;
   applyObjectObservation(match->observation);
-  RCLCPP_DEBUG(node_->get_logger(), "[Semantic] fused stamp=%lld pose=(%.3f,%.3f) score=%.4f cells=%zu",
-      static_cast<long long>(match->stamp), observation.camera_pos.x(), observation.camera_pos.y(),
-      match->score, observation.free_grids.size());
 }
 
 void MapROS::applyObjectObservation(const std::shared_ptr<SemanticObservation>& observation)
@@ -406,6 +511,9 @@ void MapROS::depthPoseCallback(
     const sensor_msgs::msg::Image::ConstSharedPtr& img,
     const nav_msgs::msg::Odometry::ConstSharedPtr& pose)
 {
+  const int64_t stamp = rclcpp::Time(img->header.stamp).nanoseconds();
+  if (stamp <= map_start_time_.nanoseconds() || stamp <= last_depth_stamp_ ||
+      img->header.frame_id != frame_id_ || pose->header.frame_id != frame_id_) return;
   // Extract camera pose from odometry message
   camera_pos_(0) = pose->pose.pose.position.x;
   camera_pos_(1) = pose->pose.pose.position.y;
@@ -414,14 +522,15 @@ void MapROS::depthPoseCallback(
       pose->pose.pose.orientation.y, pose->pose.pose.orientation.z);
 
   // Calculate camera yaw angle for value map updates
-  Eigen::Vector3d euler =
-      camera_q_.toRotationMatrix().eulerAngles(2, 1, 0);  // ZYX order: yaw, roll, pitch
-  double camera_yaw = euler[0];
+  // Depth is projected along optical +Z, which differs from robot/base yaw.
+  const Eigen::Vector3d optical_forward = camera_q_.toRotationMatrix().col(2);
+  double camera_yaw = std::atan2(optical_forward.y(),optical_forward.x());
   Eigen::Vector2d camera_pos = Eigen::Vector2d(camera_pos_(0), camera_pos_(1));
 
   // Skip processing if camera is outside map bounds
   if (!map_->isInMap(camera_pos))
     return;
+  last_depth_stamp_ = stamp;
 
   // Convert depth image format (Habitat publishes Float32, some sensors use 8UC1)
   cv_bridge::CvImagePtr cv_ptr = cv_bridge::toCvCopy(img, img->encoding);
@@ -439,9 +548,15 @@ void MapROS::depthPoseCallback(
 
   // Update occupancy grid with filtered depth data
   vector<Eigen::Vector2i> free_grids;
-  // Dilate free_grids to ensure more complete coverage
-  dilateGrids(free_grids, 1);
   map_->inputDepthCloud2D(filtered_depth_cloud2d_, camera_pos_, free_grids);
+  if (local_updated_) {
+    map_->clearAndInflateLocalMap();
+    esdf_need_update_ = true;
+    local_updated_ = false;
+  }
+  // Frontier geometry and visibility must belong to this image's timestamp.
+  // Updating only in a later planning tick would attach old scores to new nodes.
+  map_->frontier_map2d_->searchFrontiers();
   double process_time = (node_->get_clock()->now() - t1).seconds();
   RCLCPP_INFO_THROTTLE(node_->get_logger(), *node_->get_clock(), 50000,
       "[Calculating Time] Grid Map process time = %.3f s", process_time);
@@ -451,7 +566,28 @@ void MapROS::depthPoseCallback(
   auto observation = std::make_shared<SemanticObservation>();
   observation->camera_pos = camera_pos;
   observation->camera_yaw = camera_yaw;
-  observation->free_grids = std::move(free_grids);
+  // Publish original ray support and camera pose. The RGB window will select
+  // these frames for CURRENT frontier cells, including frontiers born later.
+  plan_env::msg::FrontierScan scan;
+  scan.header=img->header;
+  scan.camera_pose=pose->pose.pose;
+  scan.resolution=map_->getResolution();
+  Eigen::Vector2d origin,size;
+  map_->getRegion(origin,size);
+  scan.origin_x=origin.x();scan.origin_y=origin.y();
+  scan.max_distance=depth_filter_maxdist_;
+  for (const auto& grid : free_grids) {
+    if (!map_->isInMap(grid) || map_->getOccupancy(grid)!=SDFMap2D::FREE) continue;
+    scan.free_x.push_back(grid.x());scan.free_y.push_back(grid.y());
+  }
+  for (const auto& entry : map_->value_map_->cells()) {
+    scan.cell_ids.push_back(entry.first);
+    scan.cell_x.push_back(entry.second.geometry.ix);
+    scan.cell_y.push_back(entry.second.geometry.iy);
+  }
+  frontier_scan_pub_->publish(scan);
+  RCLCPP_DEBUG(node_->get_logger(),"[Semantic] snapshot stamp=%lld cells=%zu",
+      static_cast<long long>(stamp),scan.cell_ids.size());
   observation->camera_pos3 = camera_pos_;
   observation->camera_q = camera_q_;
   // Retain a compact depth snapshot for time-aligned negative object evidence.
@@ -465,12 +601,6 @@ void MapROS::depthPoseCallback(
   applySemanticMatch(semantic_cache_.addObservation(
       rclcpp::Time(img->header.stamp).nanoseconds(), node_->get_clock()->now().nanoseconds(), observation));
 
-  // Trigger ESDF update if local map has been updated
-  if (local_updated_) {
-    map_->clearAndInflateLocalMap();
-    esdf_need_update_ = true;
-    local_updated_ = false;
-  }
 }
 
 void MapROS::processDepthImage()

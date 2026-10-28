@@ -45,3 +45,14 @@ def normalize_objectnav_label(label: str, dataset_path: str) -> str:
         return HM3D_LABEL_MAP.get(label, label)
 
     return label
+
+
+def resolve_navigation_target(episode_label: str, dataset_path: str,
+                              description: str = None) -> str:
+    """Keep custom descriptions intact; normalize only dataset category names."""
+    if description is not None:
+        description = description.strip()
+        if not description or '\n' in description or '\r' in description:
+            raise ValueError('Target must be a nonempty, single-line description')
+        return description
+    return normalize_objectnav_label(episode_label, dataset_path)

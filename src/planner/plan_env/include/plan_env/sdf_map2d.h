@@ -34,6 +34,7 @@ struct MapData2D;
 struct DetectedObject;
 class ObjectMap2D;
 class ValueMap;
+class FrontierMap2D;
 class MapROS;
 
 class SDFMap2D {
@@ -85,6 +86,7 @@ public:
   // Integrated mapping components
   shared_ptr<ObjectMap2D> object_map2d_;
   shared_ptr<ValueMap> value_map_;
+  shared_ptr<FrontierMap2D> frontier_map2d_;
 
 private:
   // Internal map processing functions

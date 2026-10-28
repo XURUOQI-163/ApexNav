@@ -97,24 +97,27 @@ CLIP 将 `--semantic-model blip2` 改为 `--semantic-model clip`；省略该参�
 
 ## 时间对齐设计
 
-1. 同一帧 RGB、深度和 sensor_pose 共享采集时间戳；连续视觉端使用精确时间同步。
-2. C++ 建图仍持续处理深度。每帧缓存当时的相机位姿、可见自由格子和紧凑深度点云。
-3. 推理完成后发布 `/semantic/score`（`plan_env/msg/SemanticScore`）：原始 Header、backend、score。
-4. C++ 只用时间戳完全相同的缓存观测融合语义，不使用推理完成时的位置。
-   分数先到、深度先到均支持；重复分数只融合一次。旧于已融合结果的乱序分数丢弃。
-5. YOLOE 点云消息增加原始 Header。检测过滤和未检出物体的历史置信度更新也使用对应帧；
-   缺少对应深度、检测或语义结果时跳过该条证据，不拿其他帧补齐。
-6. 地图重新初始化时清空缓存，并拒绝初始化之前的观测。
+RGB、depth、sensor_pose、robot odom 共用采集时间戳。C++ 在每次建图后发布
+`/frontier_semantics/scan`，携带原图几何支持和当前前沿格子。独立收集线程精确同步
+RGB/scan/odom，保留最新 20 帧；模型推理使用原图、原相机/机器人位姿和缓存分数。
 
-旧 `/clip/cosine_score` 无时间戳话题不再参与建图；CLIP 自身 HTTP 协议不变。
-两种模型的权重、模型代码、环境、服务端口独立，共用带时间戳的 ROS 输出协议。
-语义融合公式、YOLOE 模型、探索阈值和 RViz 标记清理均未在本次调整。
+`/semantic/score`（`plan_env/msg/SemanticScore`）包含原始 Header、backend、score，
+以及当前格子 ID/投影权重。先逐格融合，再取成员格子的最大值作为前沿节点分数。
+重复证据只融合一次，删除的格子、重置前的结果和混合后端结果拒绝写入。
+同一格子最近 20 条证据按采集时间重放，更早历史折叠保存，不随整个场景无限增长。
 
-缓存默认最多 600 帧、15 秒（以先到的限制为准）。规划器 ROS 参数为
-`semantic/cache_size` 和 `semantic/max_observation_age`，在节点初始化时读取。
-超过限制、消息丢失或深度/位姿时间戳不一致时丢弃对应语义结果，不能保证每帧都融合。
-运行时会打印原始分数、采集时间戳、观测年龄；规划器 `[Semantic]` 输出缓存和丢弃计数。
-BLIP2 得分尺度与 CLIP 不同，首轮对照保持相同提示词/阈值；不承诺换模型即可提高成功率。
+仅在原图覆盖当前前沿格子且存在尚未发送的证据时，才推理或复用该图像分数，并输出日志。
+无匹配前沿的图像只缓存在窗口中；前沿在推理期间消失时，本次不发布空更新或评分日志。
+YOLOE 未检出物体的历史置信度更新只能复用这些已选图像的原图分数和深度，不再触发额外推理。
+这个对象证据缓存保留默认 600 帧/15 秒限制，参数为
+`semantic/cache_size`、`semantic/max_observation_age`。它不再限制前沿格子的回溯融合。
+
+终端 `raw` 是模型原始分数，`cells` 是该条消息的投影格子数量，`cached` 表示是否复用了
+图像分数，不是节点融合值。融合结果查看 RViz 或 `/frontier_semantics/score`。
+CLIP 和 BLIP2 的 HTTP 协议、模型、环境、端口独立；旧 `/clip/cosine_score` 无时间戳话题
+不参与建图。详细公式、内存边界和有限窗口的限制见 [前沿逐格语义记忆](frontier_semantics.md)。
+
+BLIP2 与 CLIP 得分尺度不同，不承诺换模型即可提高成功率。
 
 ## 验证
 
@@ -127,12 +130,13 @@ python -m unittest discover -s tests -v
 容器内 source ROS/install 并激活 Habitat 环境后：
 
 ```bash
-python tests/ros2_semantic_alignment.py
+PYTHONPATH="$PWD:$PYTHONPATH" python tests/ros2_semantic_alignment.py
 PYTHONPATH="$PWD:$PYTHONPATH" python tests/ros2_semantic_publisher.py
 ```
 
 集成测试使用独立 ROS_DOMAIN_ID=94。第一个启动真实 C++ 地图节点：A 帧之后相机移至
 8 米外的 B，再发送延迟 A 分数和重复分数，验证只在 A 融合一次，再验证 B。
-第二个使用受控推理延迟，验证两种后端的 Python 发布端保留原帧时间戳。
-另已使用本机缓存 BLIP2 权重完成实际 CUDA ITC 推理及 Flask HTTP 请求检查；未下载资源。
+第二个使用受控推理延迟，验证两种后端的独立收集、20 帧窗口、精确时间戳、缓存复用、
+目标切换、无关图像不调用模型、前沿出现后选择旧图，以及在途前沿消失时跳过空更新。
+此次没有运行真实模型或下载资源。
 这不是完整导航成功率评测。

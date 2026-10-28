@@ -32,7 +32,8 @@ find_package(OpenCV REQUIRED)
 rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/MultipleMasksWithConfidence.msg"
   "msg/SemanticScore.msg"
-  DEPENDENCIES std_msgs sensor_msgs
+  "msg/FrontierScan.msg"
+  DEPENDENCIES std_msgs sensor_msgs geometry_msgs
 )
 
 # Include 디렉토리 설정

@@ -32,7 +32,7 @@ void ExplorationManager::initialize(rclcpp::Node::SharedPtr node)
   object_map2d_ = sdf_map_->object_map2d_;
 
   // Initialize frontier map and path finder
-  frontier_map2d_.reset(new FrontierMap2D(sdf_map_, node_));
+  frontier_map2d_ = sdf_map_->frontier_map2d_;
   path_finder_.reset(new Astar2D);
   path_finder_->init(node_, sdf_map_);
 
@@ -272,13 +272,7 @@ void ExplorationManager::findHighestSemanticsFrontierPolicy(Vector2d cur_pos,
 
   // Compute semantic value for each frontier
   for (auto frontier : frontiers) {
-    Vector2i idx;
-    sdf_map_->posToIndex(frontier, idx);
-    auto nbrs = allNeighbors(idx, 2);  // 5x5 neighborhood
-
-    // Find maximum semantic value in local neighborhood
-    double value = sdf_map_->value_map_->getValue(idx);
-    for (auto nbr : nbrs) value = std::max(value, sdf_map_->value_map_->getValue(nbr));
+    double value = sdf_map_->value_map_->getValue(frontier);
 
     frontier_values.emplace_back(frontier, value);
   }
@@ -624,20 +618,7 @@ void ExplorationManager::getSortedSemanticFrontiers(const Vector2d& cur_pos,
     SemanticFrontier sem_frontier;
     sem_frontier.position = frontier;
 
-    // Compute semantic value from local neighborhood
-    Vector2i idx;
-    sdf_map_->posToIndex(frontier, idx);
-    auto nbrs = allNeighbors(idx, 2);  // 5x5 grid neighborhood
-    double value = sdf_map_->value_map_->getValue(idx);
-
-    // Find maximum semantic value in neighborhood (ignoring occupied cells)
-    for (auto& nbr : nbrs) {
-      if (sdf_map_->getInflateOccupancy(idx) == 1 ||
-          sdf_map_->getOccupancy(idx) == SDFMap2D::OCCUPIED)
-        continue;
-      value = std::max(value, sdf_map_->value_map_->getValue(nbr));
-    }
-    sem_frontier.semantic_value = value;
+    sem_frontier.semantic_value = sdf_map_->value_map_->getValue(frontier);
 
     // Validate reachability and compute path cost
     Vector2d tmp_pos;

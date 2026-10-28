@@ -50,10 +50,11 @@ struct Frontier2D {
 
 class FrontierMap2D {
 public:
-  FrontierMap2D(const shared_ptr<SDFMap2D>& sdf_map, rclcpp::Node::SharedPtr node);
+  FrontierMap2D(SDFMap2D* sdf_map, rclcpp::Node::SharedPtr node);
   ~FrontierMap2D(){};
 
   void searchFrontiers();
+  void syncSemanticFrontiers();
   bool dormantSeenFrontiers(Vector2d sensor_pos, double sensor_yaw);
   void setForceDormantFrontier(const Vector2d& frontier_center);
 
@@ -61,6 +62,9 @@ public:
   void getDormantFrontiers(vector<vector<Vector2d>>& clusters, vector<Vector2d>& averages);
   void getFrontierBoxes(vector<pair<Vector2d, Vector2d>>& boxes);
   bool isAnyFrontierChanged();
+  void acknowledgeChanges() { frontier_changed_ = false; }
+  const list<Frontier2D>& activeFrontiers() const { return frontiers_; }
+  const list<Frontier2D>& dormantFrontiers() const { return dormant_frontiers_; }
   void wrapYaw(double& yaw);
 
   shared_ptr<PerceptionUtils2D> percep_utils_;
@@ -99,7 +103,9 @@ private:
   double min_view_finish_fraction_, resolution_;
   int min_contain_unknown_;
 
-  shared_ptr<SDFMap2D> sdf_map_;
+  SDFMap2D* sdf_map_;
+  int next_frontier_id_ = 0;
+  bool frontier_changed_ = false;
   unique_ptr<RayCaster2D> raycaster_;
 };
 

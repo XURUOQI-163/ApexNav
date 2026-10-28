@@ -18,14 +18,14 @@ from omegaconf import DictConfig
 from sensor_msgs.msg import Image
 from nav_msgs.msg import Odometry
 from std_msgs.msg import Float64, String
-from plan_env.msg import MultipleMasksWithConfidence, SemanticScore
+from plan_env.msg import MultipleMasksWithConfidence
 
 current_dir = os.path.dirname(os.path.realpath(__file__))
 parent_dir = os.path.dirname(current_dir)
 sys.path.append(parent_dir)
 
 from vlm.utils.get_object_utils import get_object
-from vlm.utils.get_semantic_similarity import get_semantic_similarity
+from habitat2ros.frontier_semantics import FrontierSemanticBridge
 from llm.answer_reader.answer_reader import read_answer
 from basic_utils.object_point_cloud_utils.object_point_cloud import (
     get_object_point_cloud,
@@ -81,8 +81,6 @@ class RealWorldNode(Node):
         # Configure publishers
         self.confidence_threshold_pub_ = self.create_publisher(
             Float64, "/detector/confidence_threshold", qos)
-        self.semantic_score_pub_ = self.create_publisher(
-            SemanticScore, "/semantic/score", qos)
         self.cld_with_score_pub_ = self.create_publisher(
             MultipleMasksWithConfidence, "/yoloe/clouds_with_scores", qos)
         self.detect_img_pub_ = self.create_publisher(
@@ -96,14 +94,6 @@ class RealWorldNode(Node):
         )
         self.sync_detect.registerCallback(self.sync_detect_callback)
 
-        # Initialize value module
-        # (uses synchronized RGB/depth/sensor_pose messages)
-        self.sync_value = message_filters.TimeSynchronizer(
-            [self.rgb_sub_, self.depth_sub_, self.sensor_pose_sub_],
-            queue_size=5,
-        )
-        self.sync_value.registerCallback(self.sync_value_callback)
-
         # Initialize odometry handling
         self.robot_odom = None
         self.T_base_camera = None
@@ -111,7 +101,6 @@ class RealWorldNode(Node):
         # Processing flags: ensure we don't start a new processing run
         # until the previous one finished (rate adapts to available compute)
         self.processing_detect = False
-        self.processing_value = False
 
         # LLM config (used when label is provided via topic)
         llm_cfg = self.config.llm
@@ -130,6 +119,7 @@ class RealWorldNode(Node):
         self.create_subscription(String, "/detector/label", self.label_callback, 1)
 
         self.create_timer(1.0, self.publish_confidence_threshold)
+        self.semantic_bridge = FrontierSemanticBridge(self.semantic_backend)
 
     def sync_detect_callback(self, rgb_msg, depth_msg, sensor_pose_msg):
         # If a detect run is already in progress, skip this invocation.
@@ -196,39 +186,6 @@ class RealWorldNode(Node):
             # mark processing complete so next invocation can proceed
             self.processing_detect = False
 
-    def sync_value_callback(self, rgb_msg, depth_msg, sensor_pose_msg):
-        if self.label is None or self.room is None:
-            return
-        # If a value run is already in progress, skip this invocation.
-        if self.processing_value:
-            return
-        self.processing_value = True
-        try:
-            stamp = rgb_msg.header.stamp
-            time_diff = abs((stamp.sec + stamp.nanosec * 1e-9) -
-                          (sensor_pose_msg.header.stamp.sec + sensor_pose_msg.header.stamp.nanosec * 1e-9))
-            if time_diff > 0.1:
-                # If timestamps differ significantly, skip this pair
-                return
-
-            rgb_cv = self.bridge.imgmsg_to_cv2(rgb_msg, desired_encoding="rgb8")
-
-            cosine = get_semantic_similarity(rgb_cv, self.label, self.room, self.semantic_backend)
-            score_msg = SemanticScore()
-            score_msg.header = rgb_msg.header  # acquisition stamp, unchanged by HTTP latency
-            score_msg.backend = self.semantic_backend
-            score_msg.score = float(cosine)
-            self.semantic_score_pub_.publish(score_msg)
-            age = (self.get_clock().now().nanoseconds -
-                   (stamp.sec * 1_000_000_000 + stamp.nanosec)) / 1e9
-            self.get_logger().info(
-                f"semantic[{self.semantic_backend}]: raw cosine={cosine:.4f}, "
-                f"frame={stamp.sec}.{stamp.nanosec:09d}, age={age:.3f}s")
-        except Exception as e:
-            self.get_logger().error(f"value: Error in synchronized processing: {e}")
-        finally:
-            self.processing_value = False
-
     def label_callback(self, msg):
         """Handle incoming label messages and update LLM answers if configured."""
         try:
@@ -248,6 +205,7 @@ class RealWorldNode(Node):
                 self.llm_answer = []
                 self.room = "everywhere"
                 self.fusion_score = 0.5
+            self.semantic_bridge.set_target(self.label,self.room)
         except Exception as e:
             self.get_logger().error(f"label_callback: Error processing label message: {e}")
 
@@ -266,6 +224,10 @@ class RealWorldNode(Node):
         confidence_threshold_msg = Float64()
         confidence_threshold_msg.data = float(self.fusion_score)
         self.confidence_threshold_pub_.publish(confidence_threshold_msg)
+
+    def destroy_node(self):
+        self.semantic_bridge.close()
+        return super().destroy_node()
 
     def run(self):
         self.get_logger().info("RealWorldNode running. Waiting for sensor messages...")

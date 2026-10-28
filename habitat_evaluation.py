@@ -34,12 +34,13 @@ from hydra import initialize, compose
 import numpy as np
 import rclpy
 from rclpy.node import Node
+from rclpy.signals import SignalHandlerOptions
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 from geometry_msgs.msg import PoseStamped
 from omegaconf import DictConfig
 from prettytable import PrettyTable
 from sensor_msgs.msg import PointCloud2
-from std_msgs.msg import Int32, Int32MultiArray, Float32MultiArray, Float64
+from std_msgs.msg import Int32, Int32MultiArray, Float32MultiArray, Float64, Header
 import tqdm
 
 # Habitat-related imports
@@ -58,7 +59,7 @@ from habitat.utils.visualizations.utils import (
 )
 
 # ROS message imports
-from plan_env.msg import MultipleMasksWithConfidence, SemanticScore
+from plan_env.msg import MultipleMasksWithConfidence
 
 # Local project imports
 from basic_utils.failure_check.count_files import count_files_in_directory
@@ -69,15 +70,16 @@ from basic_utils.object_point_cloud_utils.object_point_cloud import (
 from basic_utils.record_episode.read_record import read_record
 from basic_utils.record_episode.write_record import write_record
 from habitat2ros.habitat_publisher import ROSPublisherNonNode
+from habitat2ros.episode_reset import reset_episode
 from llm.answer_reader.answer_reader import read_answer
 from params import HABITAT_STATE, ROS_STATE, ACTION, RESULT_TYPES
-from vlm.label_utils import normalize_objectnav_label
-from vlm.utils.get_semantic_similarity import get_semantic_similarity
+from vlm.label_utils import resolve_navigation_target
+from habitat2ros.frontier_semantics import FrontierSemanticBridge
 from vlm.utils.get_object_utils import get_object
 
 
 class HabitatEvalNode(Node):
-    def __init__(self):
+    def __init__(self, backend='clip'):
         super().__init__('habitat_eval_node')
 
         # QoS profile
@@ -101,7 +103,7 @@ class HabitatEvalNode(Node):
             PointCloud2, "habitat/object_point_cloud", qos)
         self.state_pub = self.create_publisher(Int32, "/habitat/state", qos)
         self.trigger_pub = self.create_publisher(PoseStamped, "/move_base_simple/goal", qos)
-        self.semantic_score_pub = self.create_publisher(SemanticScore, "/semantic/score", qos)
+        self.semantic_bridge = FrontierSemanticBridge(backend)
         self.confidence_threshold_pub = self.create_publisher(
             Float64, "/detector/confidence_threshold", qos)
         self.cld_with_score_pub = self.create_publisher(
@@ -117,6 +119,10 @@ class HabitatEvalNode(Node):
         self.create_subscription(Int32, "/ros/state", self.ros_state_callback, qos)
         self.create_subscription(Int32, "/ros/expl_state", self.ros_final_state_callback, qos)
         self.create_subscription(Int32, "/ros/expl_result", self.ros_expl_result_callback, qos)
+
+    def destroy_node(self):
+        self.semantic_bridge.close()
+        return super().destroy_node()
 
     def ros_action_callback(self, msg):
         self.global_action = msg.data
@@ -179,12 +185,13 @@ def transform_rgb_bgr(image):
 def signal_handler(sig, frame):
     """Handle Ctrl+C signal for graceful shutdown"""
     print("Ctrl+C detected! Shutting down...")
-    rclpy.shutdown()
-    os._exit(0)
+    raise KeyboardInterrupt
 
 
-def main(cfg: DictConfig, node: HabitatEvalNode, step_delay: float = 0.0) -> None:
+def main(cfg: DictConfig, node: HabitatEvalNode, step_delay: float = 0.0,
+         target_description: str = None) -> None:
     start_time = time.time()
+    custom_target = target_description is not None
 
     node.final_state = 0
     node.expl_result = 0
@@ -209,6 +216,10 @@ def main(cfg: DictConfig, node: HabitatEvalNode, step_delay: float = 0.0) -> Non
 
     # Single test parameters
     env_num_once = cfg.test_epi_num  # Which episode to test for single run
+    if custom_target:
+        if env_num_once < -1:
+            raise ValueError('test_epi_num must be -1 or a nonnegative episode index')
+        env_num_once = max(0, env_num_once)
     flag_once = env_num_once != -1  # Whether to run single test
 
     # Create directories if they don't exist
@@ -224,9 +235,9 @@ def main(cfg: DictConfig, node: HabitatEvalNode, step_delay: float = 0.0) -> Non
                     map_resolution=256,
                     draw_source=True,
                     draw_border=True,
-                    draw_shortest_path=True,
-                    draw_view_points=True,
-                    draw_goal_positions=True,
+                    draw_shortest_path=not custom_target,
+                    draw_view_points=not custom_target,
+                    draw_goal_positions=not custom_target,
                     draw_goal_aabbs=False,
                     fog_of_war=FogOfWarConfig(
                         draw=True,
@@ -241,6 +252,9 @@ def main(cfg: DictConfig, node: HabitatEvalNode, step_delay: float = 0.0) -> Non
     env = habitat.Env(cfg)
     print("Environment creation successful")
     number_of_episodes = env.number_of_episodes
+    if custom_target and env_num_once >= number_of_episodes:
+        env.close()
+        raise ValueError(f'Episode index {env_num_once} is outside [0, {number_of_episodes - 1}]')
 
     # Read previous records and set initial values
     (
@@ -259,6 +273,11 @@ def main(cfg: DictConfig, node: HabitatEvalNode, step_delay: float = 0.0) -> Non
     pbar = tqdm.tqdm(total=env.number_of_episodes)
 
     env_count = num_total if not flag_once else env_num_once
+    if custom_target:
+        # Match continuous mode's zero-based selection exactly; assigning the
+        # episode also prevents Habitat.reset() from advancing its iterator.
+        env.current_episode = env.episodes[env_num_once]
+        env_count = 0
     while env_count:
         pbar.update()
         env.current_episode = next(env.episode_iterator)
@@ -285,22 +304,28 @@ def main(cfg: DictConfig, node: HabitatEvalNode, step_delay: float = 0.0) -> Non
         observations["camera_pitch"] = camera_pitch
         node.msg_observations = deepcopy(observations)
         del observations["camera_pitch"]
-        label = env.current_episode.object_category
-
-        label = normalize_objectnav_label(label, cfg.habitat.dataset.data_path)
+        label = resolve_navigation_target(env.current_episode.object_category,
+                                          cfg.habitat.dataset.data_path, target_description)
+        if custom_target:
+            print(f'Custom target: {label}; scene={env.current_episode.scene_id}; '
+                  f'episode_id={env.current_episode.episode_id}', flush=True)
 
         # Get LLM answer and fusion threshold for the target object
         llm_answer, room, node.fusion_threshold = read_answer(
             llm_answer_path, llm_response_path, label, llm_client
         )
 
+        node.semantic_bridge.set_target(label,room,force=True)
+
         # Initialize video frame collection
         vis_frames = []
         info = env.get_metrics()
         if need_video:
-            frame = observations_to_image(observations, info)
-            info.pop("top_down_map")
-            frame = overlay_frame(frame, info)
+            visual_observations = {k:v for k,v in observations.items() if hasattr(v, 'shape')}
+            frame = observations_to_image(visual_observations, info)
+            if not custom_target:
+                info.pop("top_down_map")
+                frame = overlay_frame(frame, info)
             vis_frames = [frame]
 
         # Start publishing basic information and trigger messages
@@ -334,15 +359,16 @@ def main(cfg: DictConfig, node: HabitatEvalNode, step_delay: float = 0.0) -> Non
                 trigger = PoseStamped()
                 node.trigger_pub.publish(trigger)
 
-            # Skip episode if target is not on the same floor
-            is_feasible = 0
-            for goal in env.current_episode.goals:
-                height = goal.position[1]
-                is_feasible += is_on_same_floor(
-                    height=height, episode=env.current_episode
-                )
-            if not is_feasible:
-                break
+            # Dataset goal positions do not describe a custom text target.
+            if not custom_target:
+                is_feasible = 0
+                for goal in env.current_episode.goals:
+                    height = goal.position[1]
+                    is_feasible += is_on_same_floor(
+                        height=height, episode=env.current_episode
+                    )
+                if not is_feasible:
+                    break
 
             # Parse action from decision system
             action = None
@@ -383,26 +409,16 @@ def main(cfg: DictConfig, node: HabitatEvalNode, step_delay: float = 0.0) -> Non
             # preserves this identity; geometry and semantic score can arrive in either order.
             observations["ros_stamp"] = node.get_clock().now().to_msg()
             observations["camera_pitch"] = camera_pitch
-            node.ros_pub.habitat_publish_ros_topic(observations)
-            backend = cfg.get("semantic_model", "clip")
-            cosine = get_semantic_similarity(observations["rgb"], label, room, backend)
-            print(f"Target related room: {room}")
-            print(f"Semantic [{backend}] raw cosine similarity: {cosine:.4f}")
-            score_msg = SemanticScore()
-            score_msg.header.stamp = observations["ros_stamp"]
-            score_msg.header.frame_id = "world"
-            score_msg.backend = backend
-            score_msg.score = float(cosine)
-            node.semantic_score_pub.publish(score_msg)
-
+            # Only raw RGB is allowed on the synchronized sensor topic. Keep
+            # annotated output for video; all repeat publications use this copy.
+            node.msg_observations = deepcopy(observations)
+            node.ros_pub.habitat_publish_ros_topic(node.msg_observations)
             # Detect objects in the current observation
             observations["rgb"], score_list, object_masks_list, label_list = get_object(
                 label, observations["rgb"], detector_cfg, llm_answer
             )
 
             # Publish habitat observations to ROS
-            observations["camera_pitch"] = camera_pitch
-            node.msg_observations = deepcopy(observations)
             del observations["camera_pitch"]
             node.ros_pub.habitat_publish_ros_topic(node.msg_observations)
 
@@ -412,7 +428,7 @@ def main(cfg: DictConfig, node: HabitatEvalNode, step_delay: float = 0.0) -> Non
             )
 
             # Publish detection-related information
-            cld_with_score_msg.header = score_msg.header
+            cld_with_score_msg.header = Header(stamp=observations["ros_stamp"], frame_id="world")
             cld_with_score_msg.point_clouds = obj_point_cloud_list
             cld_with_score_msg.confidence_scores = score_list
             cld_with_score_msg.label_indices = label_list
@@ -421,15 +437,19 @@ def main(cfg: DictConfig, node: HabitatEvalNode, step_delay: float = 0.0) -> Non
             # Generate video frame
             info = env.get_metrics()
             if need_video:
-                frame = observations_to_image(observations, info)
-                info.pop("top_down_map")
-                frame = overlay_frame(frame, info)
+                # Acquisition timestamps are metadata, not visual sensors.
+                visual_observations = {k:v for k,v in observations.items() if hasattr(v, 'shape')}
+                frame = observations_to_image(visual_observations, info)
+                if not custom_target:
+                    info.pop("top_down_map")
+                    frame = overlay_frame(frame, info)
                 vis_frames.append(frame)
 
             # Track if agent has passed close to the target
-            distance_to_goal = info["distance_to_goal"]
-            if distance_to_goal <= success_distance and pass_object == 0:
-                pass_object = 1
+            if not custom_target:
+                distance_to_goal = info["distance_to_goal"]
+                if distance_to_goal <= success_distance and pass_object == 0:
+                    pass_object = 1
 
             # Optional delay between steps for visualization
             if step_delay > 0:
@@ -439,15 +459,17 @@ def main(cfg: DictConfig, node: HabitatEvalNode, step_delay: float = 0.0) -> Non
             node.publish_int32(node.state_pub, HABITAT_STATE.ACTION_FINISH)
 
         # Notify ROS system that current episode evaluation is complete
-        node.publish_int32(node.state_pub, HABITAT_STATE.EPISODE_FINISH)
+        node.stop_observation_timer()
+        node.msg_observations = None
+        node.semantic_bridge.set_target(label,room,force=True)
+        reset_episode(node)
 
-        # Wait for FSM to process EPISODE_FINISH and reset to INIT state
-        # This prevents a race condition where the next episode starts
-        # before the FSM has re-initialized
-        for _ in range(50):  # up to 5 seconds
-            rclpy.spin_once(node, timeout_sec=0.1)
-            if node.ros_state == ROS_STATE.INIT:
-                break
+        if custom_target:
+            if need_video:
+                images_to_video(vis_frames, 'videos', 'custom_target', fps=6, quality=9)
+            vis_frames.clear()
+            print(f'Custom-target simulation ended: target={label}, steps={count_steps}', flush=True)
+            break
 
         # Collect evaluation metrics
         info = env.get_metrics()
@@ -588,15 +610,29 @@ def run_cli(argv=None):
 
     if args.mode == 'continuous':
         from habitat_vel_control import run_continuous
-        run_continuous(cfg)
+        run_continuous(cfg, target_description=args.target)
         return
 
+    rclpy.init(signal_handler_options=SignalHandlerOptions.NO)
     signal.signal(signal.SIGINT, signal_handler)
-    rclpy.init()
-    node = HabitatEvalNode()
+    signal.signal(signal.SIGTERM, signal_handler)
+    node = HabitatEvalNode(args.semantic_model)
     try:
-        main(cfg, node, step_delay=args.delay)
+        reset_episode(node)
+        node.global_action = None
+        node.ros_state = ROS_STATE.INIT
+        main(cfg, node, step_delay=args.delay, target_description=args.target)
+    except KeyboardInterrupt:
+        print('Discrete simulation interrupted.', flush=True)
     finally:
+        node.stop_observation_timer()
+        node.msg_observations = None
+        node.semantic_bridge.close()
+        if rclpy.ok():
+            try:
+                reset_episode(node, timeout=3.)
+            except Exception as exc:
+                node.get_logger().warning(f'Exit reset incomplete: {exc}; next startup will retry')
         node.destroy_node()
         if rclpy.ok():
             rclpy.shutdown()

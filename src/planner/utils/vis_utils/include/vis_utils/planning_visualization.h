@@ -56,6 +56,8 @@ public:
   }
   PlanningVisualization(rclcpp::Node::SharedPtr node);
 
+  void clearAll();
+
   // new interface
   void fillBasicInfo(visualization_msgs::msg::Marker& mk, const Eigen::Vector3d& scale,
       const Eigen::Vector4d& color, const string& ns, const int& id, const int& shape);

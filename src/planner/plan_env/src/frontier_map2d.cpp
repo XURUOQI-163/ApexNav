@@ -11,10 +11,12 @@
  * @author Zager-Zhang
  */
 #include <plan_env/frontier_map2d.h>
+#include <plan_env/value_map2d.h>
+#include <plan_env/frontier_ids.h>
 #include <unordered_map>
 
 namespace apexnav_planner {
-FrontierMap2D::FrontierMap2D(const SDFMap2D::Ptr& sdf_map, rclcpp::Node::SharedPtr node)
+FrontierMap2D::FrontierMap2D(SDFMap2D* sdf_map, rclcpp::Node::SharedPtr node)
 {
   // Initialize core mapping infrastructure
   this->sdf_map_ = sdf_map;
@@ -58,6 +60,7 @@ void FrontierMap2D::searchFrontiers()
 {
   // Clear previous candidate frontiers from current search iteration
   candidate_frontiers_.clear();
+  std::unordered_map<int,int> previous_boundary;
 
   // Determine spatial bounds of recently updated map regions
   Vector2d update_min, update_max;
@@ -65,10 +68,12 @@ void FrontierMap2D::searchFrontiers()
 
   // Lambda function for efficient frontier removal and flag reset
   auto resetFlag = [&](list<Frontier2D>::iterator& iter, list<Frontier2D>& frontiers) {
+    frontier_changed_ = true;
     Eigen::Vector2i idx;
     // Reset frontier flags for all cells in the frontier cluster
     for (auto cell : iter->cells_) {
       sdf_map_->posToIndex(cell, idx);
+      previous_boundary[toAdr(idx)] = iter->id_;
       frontier_flag_[toAdr(idx)] = NONE;
     }
     // Remove frontier from container and return updated iterator
@@ -123,14 +128,53 @@ void FrontierMap2D::searchFrontiers()
     }
 
   // Apply PCA-based subdivision to large frontier clusters
-  splitLargeFrontiers(candidate_frontiers_);
+  // Keep each connected frontier intact; disable the 0.65 m PCA subdivision.
+  // splitLargeFrontiers(candidate_frontiers_);
+  frontier_changed_ |= !candidate_frontiers_.empty();
 
-  // Integrate newly discovered frontiers into active frontier set
-  for (auto& tmp_ftr : candidate_frontiers_) frontiers_.insert(frontiers_.end(), tmp_ftr);
+  // Preserve identities through cluster rebuilding by boundary-cell overlap.
+  // IDs are monotonic: a vanished cluster cannot receive a late old score even
+  // if an unrelated frontier appears later at the same coordinates.
+  std::vector<std::map<int,int>> candidate_overlaps;
+  for (auto& frontier : candidate_frontiers_) {
+    std::map<int,int> overlaps;
+    for (const auto& cell : frontier.cells_) {
+      Eigen::Vector2i idx;
+      sdf_map_->posToIndex(cell,idx);
+      auto old = previous_boundary.find(toAdr(idx));
+      if (old != previous_boundary.end()) ++overlaps[old->second];
+    }
+    candidate_overlaps.push_back(std::move(overlaps));
+  }
+  const auto ids = matchFrontierIds(candidate_overlaps,next_frontier_id_);
+  size_t candidate = 0;
+  for (auto& frontier : candidate_frontiers_) {
+    frontier.id_ = ids[candidate++];
+    frontiers_.push_back(frontier);
+  }
+  syncSemanticFrontiers();
+}
 
-  // Reassign unique identifiers to maintain frontier tracking consistency
-  int idx = 0;
-  for (auto& ft : frontiers_) ft.id_ = idx++;
+void FrontierMap2D::syncSemanticFrontiers()
+{
+  std::vector<FrontierGeometry> current;
+  std::vector<FrontierCellGeometry> cells;
+  auto append = [&](const list<Frontier2D>& clusters, bool active) {
+    for (const auto& f : clusters) {
+      FrontierGeometry node{f.id_,f.average_.x(),f.average_.y(),active,{}};
+      for (const auto& p : f.cells_) {
+        Eigen::Vector2i idx;
+        sdf_map_->posToIndex(p,idx);
+        const int key=sdf_map_->toAddress(idx);
+        node.cells.push_back(key);
+        cells.push_back({key,idx.x(),idx.y(),p.x(),p.y()});
+      }
+      current.push_back(std::move(node));
+    }
+  };
+  append(frontiers_,true);
+  append(dormant_frontiers_,false);
+  sdf_map_->value_map_->syncFrontiers(current,cells);
 }
 
 void FrontierMap2D::expandFrontier(const Eigen::Vector2i& first)
@@ -335,6 +379,8 @@ bool FrontierMap2D::dormantSeenFrontiers(Vector2d sensor_pos, double sensor_yaw)
       ++it;  // Continue to next frontier if no state change required
     }
   }
+  frontier_changed_ |= change_flag;
+  syncSemanticFrontiers();
   return change_flag;
 }
 
@@ -376,6 +422,7 @@ void FrontierMap2D::computeFrontierInfo(Frontier2D& ftr)
 
 bool FrontierMap2D::isAnyFrontierChanged()
 {
+  if (frontier_changed_) return true;
   // Get spatial bounds of recently updated map regions
   Vector2d update_min, update_max;
   sdf_map_->getLocalUpdatedBox(update_min, update_max);
@@ -457,6 +504,7 @@ int FrontierMap2D::countConnectUnknownGrids(const Eigen::Vector2d& pos)
 
 void FrontierMap2D::setForceDormantFrontier(const Vector2d& frontier_center)
 {
+  frontier_changed_ = true;
   // Initialize data structures for region growing around specified center
   queue<Eigen::Vector2i> cell_queue;
   vector<Eigen::Vector2d> expanded;
@@ -514,11 +562,13 @@ void FrontierMap2D::setForceDormantFrontier(const Vector2d& frontier_center)
       ++it;
     }
   }
+  syncSemanticFrontiers();
 }
 
 void FrontierMap2D::getFrontiers(
     vector<vector<Eigen::Vector2d>>& clusters, vector<Vector2d>& averages)
 {
+  syncSemanticFrontiers();
   clusters.clear();
   averages.clear();
 

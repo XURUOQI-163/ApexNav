@@ -39,13 +39,17 @@ public:
   size_t size() const { return entries_.size(); }
   size_t dropped() const { return dropped_; }
 private:
-  struct Entry { std::optional<Observation> observation; std::optional<double> score; };
+  struct Entry {
+    std::optional<Observation> observation;
+    std::optional<double> score;
+    bool matched = false;
+  };
   std::map<int64_t, Entry> entries_;
   size_t capacity_, dropped_ = 0;
   int64_t max_age_, retired_;
   void retireFirst() {
     retired_ = std::max(retired_, entries_.begin()->first);
-    if (entries_.begin()->second.score) ++dropped_;
+    if (entries_.begin()->second.score && !entries_.begin()->second.matched) ++dropped_;
     entries_.erase(entries_.begin());
   }
   bool accept(int64_t stamp, int64_t now) {
@@ -58,13 +62,12 @@ private:
   }
   std::optional<Match> finish(int64_t stamp) {
     auto& entry = entries_.at(stamp);
-    if (entry.observation && entry.score) {
+    if (entry.observation && entry.score && !entry.matched) {
       Match result{stamp, *entry.observation, *entry.score};
-      entry.score.reset();
-      // A single serial inference worker produces monotonic timestamps.
-      // Discard late older results rather than reintroducing stale evidence.
-      retired_ = stamp;
-      entries_.erase(entries_.begin(), entries_.lower_bound(stamp));
+      entry.matched = true;
+      // Semantic inference and YOLO now run independently. Keep original depth
+      // for delayed detections even after a newer semantic frame has finished.
+      while (entries_.size() > capacity_) retireFirst();
       return result;
     }
     while (entries_.size() > capacity_) retireFirst();

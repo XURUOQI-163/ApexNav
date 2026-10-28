@@ -49,8 +49,13 @@ llm:
   llm_answer_path: llm/answers/llm_answer_mp3d.txt
   llm_response_path: llm/answers/llm_response_list.txt
   llm_client:
-    llm_client: ollama # deepseek, ollama, or none
+    llm_client: ollama # qwen (cloud), deepseek, ollama (local), none
     ollama: 'qwen3:8b'
+    cache_policy: read_write # read_write, refresh, off
+    qwen:
+      model: qwen-plus # QWEN_MODEL environment variable overrides this
+      base_url: https://dashscope.aliyuncs.com/compatible-mode/v1 # or DASHSCOPE_BASE_URL
+      timeout: 30
 
 record_file_name: "record.txt"
 continue_file_name: "continue.txt"

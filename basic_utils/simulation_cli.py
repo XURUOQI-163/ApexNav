@@ -9,8 +9,14 @@ def parse_simulation_args(argv=None, default_mode='discrete'):
     parser.add_argument('--semantic-model', choices=['clip', 'blip2'], default='clip',
                         help='Scene similarity backend; requires the corresponding HTTP service')
     parser.add_argument('--dataset', choices=['hm3dv1', 'hm3dv2', 'mp3d'], default='hm3dv2')
+    parser.add_argument('--target', default=None, metavar='DESCRIPTION',
+                        help='Custom target, e.g. "yellow chair"; run one scene without dataset evaluation')
     parser.add_argument('--delay', type=float, default=0., help='Extra delay per discrete action, in seconds')
     args, overrides = parser.parse_known_args(argv)
+    if args.target is not None:
+        args.target = args.target.strip()
+        if not args.target or '\n' in args.target or '\r' in args.target:
+            parser.error('--target must be a nonempty, single-line description')
     if args.delay < 0:
         parser.error('--delay must be nonnegative')
     if args.mode == 'continuous' and args.delay != 0:

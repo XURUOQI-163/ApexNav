@@ -14,13 +14,14 @@ void ExplorationFSMReal::init(rclcpp::Node::SharedPtr node)
 {
   bool first_init = (node_ == nullptr);
   node_ = node;
+  episode_start_time_ = node_->get_clock()->now();
   fp_.reset(new FSMParam);
   fd_.reset(new FSMData);
 
   /* Initialize main modules */
   expl_manager_.reset(new ExplorationManager);
   expl_manager_->initialize(node_);
-  visualization_.reset(new PlanningVisualization(node_));
+  if (first_init) visualization_.reset(new PlanningVisualization(node_));
   fp_->vis_scale_ = expl_manager_->sdf_map_->getResolution() * FSMConstantsReal::VIS_SCALE_FACTOR;
 
   state_ = RealFSM::State::INIT;
@@ -45,6 +46,15 @@ void ExplorationFSMReal::init(rclcpp::Node::SharedPtr node)
   fp_->replan_timeout_ = node_->get_parameter("fsm/replan_timeout").as_double();
 
   if (!first_init) return;  // Skip timer/sub/pub creation on re-init (episode reset)
+
+  reset_service_ = node_->create_service<std_srvs::srv::Trigger>(
+      "/exploration/reset",
+      [this](const std::shared_ptr<std_srvs::srv::Trigger::Request>,
+             std::shared_ptr<std_srvs::srv::Trigger::Response> response) {
+        resetEpisode();
+        response->success = true;
+        response->message = "Episode reset: map, frontiers, semantic cache and planner cleared";
+      });
 
   /* ROS2 Timer */
   exec_timer_ = node_->create_wall_timer(
@@ -424,28 +434,8 @@ void ExplorationFSMReal::visualize()
     return vec3d;
   };
 
-  // Draw frontiers
-  static int last_ftr2d_num = 0;
-  for (int i = 0; i < (int)ed_ptr->frontiers_.size(); ++i) {
-    visualization_->drawCubes(vec2dTo3d(ed_ptr->frontiers_[i]), fp_->vis_scale_,
-        visualization_->getColor(double(i) / ed_ptr->frontiers_.size(), 1.0), "frontier", i, 4);
-  }
-  for (int i = ed_ptr->frontiers_.size(); i < last_ftr2d_num; ++i) {
-    visualization_->drawCubes({}, fp_->vis_scale_, Eigen::Vector4d(0, 0, 0, 1), "frontier", i, 4);
-  }
-  last_ftr2d_num = ed_ptr->frontiers_.size();
-
-  // Draw dormant frontiers
-  static int last_dftr2d_num = 0;
-  for (int i = 0; i < (int)ed_ptr->dormant_frontiers_.size(); ++i) {
-    visualization_->drawCubes(vec2dTo3d(ed_ptr->dormant_frontiers_[i]), fp_->vis_scale_,
-        Eigen::Vector4d(0, 0, 0, 1), "dormant_frontier", i, 4);
-  }
-  for (int i = ed_ptr->dormant_frontiers_.size(); i < last_dftr2d_num; ++i) {
-    visualization_->drawCubes(
-        {}, fp_->vis_scale_, Eigen::Vector4d(0, 0, 0, 1), "dormant_frontier", i, 4);
-  }
-  last_dftr2d_num = ed_ptr->dormant_frontiers_.size();
+  // Current frontier boundaries and centers are published by MapROS,
+  // using the same sparse semantic score for both (including unscored nodes).
 
   // Draw objects
   static int last_obj_num = 0;
@@ -493,11 +483,12 @@ bool ExplorationFSMReal::updateFrontierAndObject()
   Eigen::Vector2d sensor_pos = Eigen::Vector2d(fd_->odom_pos_(0), fd_->odom_pos_(1));
 
   change_flag = frt_map->isAnyFrontierChanged();
-  frt_map->searchFrontiers();
+  // Geometry is refreshed at depth acquisition time by MapROS.
   change_flag |= frt_map->dormantSeenFrontiers(sensor_pos, fd_->odom_yaw_);
   frt_map->getFrontiers(ed->frontiers_, ed->frontier_averages_);
   frt_map->getDormantFrontiers(ed->dormant_frontiers_, ed->dormant_frontier_averages_);
   obj_map->getObjects(ed->objects_, ed->object_averages_, ed->object_labels_);
+  frt_map->acknowledgeChanges();
 
   return change_flag;
 }
@@ -525,6 +516,7 @@ void ExplorationFSMReal::triggerCallback(const geometry_msgs::msg::PoseStamped::
 
 void ExplorationFSMReal::odometryCallback(const nav_msgs::msg::Odometry::SharedPtr msg)
 {
+  if (rclcpp::Time(msg->header.stamp) <= episode_start_time_) return;
   fd_->odom_pos_(0) = msg->pose.pose.position.x;
   fd_->odom_pos_(1) = msg->pose.pose.position.y;
   fd_->odom_pos_(2) = msg->pose.pose.position.z;
@@ -713,12 +705,29 @@ void ExplorationFSMReal::transitState(RealFSM::State new_state, std::string pos_
   state_ = new_state;
 }
 
+void ExplorationFSMReal::resetEpisode()
+{
+  stop_pub_->publish(std_msgs::msg::Empty());
+  replan_fail_count_ = 0;
+  visualization_->clearAll();
+  visualization_msgs::msg::Marker clear;
+  clear.header.frame_id = "world";
+  clear.header.stamp = node_->get_clock()->now();
+  clear.action = visualization_msgs::msg::Marker::DELETEALL;
+  robot_marker_pub_->publish(clear);
+  init(node_);
+  std_msgs::msg::Int32 state;
+  state.data = 0;  // INIT, published only after reconstruction has completed.
+  ros_state_pub_->publish(state);
+  RCLCPP_INFO(node_->get_logger(), "[Episode] Map, frontiers and semantic history cleared");
+}
+
 void ExplorationFSMReal::habitatStateCallback(const std_msgs::msg::Int32::SharedPtr msg)
 {
   // HABITAT_STATE::EPISODE_FINISH = 3
   if (msg->data == 3) {
     RCLCPP_INFO(node_->get_logger(), "[Real] Episode finished, reinitializing...");
-    init(node_);
+    resetEpisode();
   }
 }
 

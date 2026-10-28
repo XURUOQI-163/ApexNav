@@ -34,7 +34,7 @@ import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 from omegaconf import DictConfig
-from std_msgs.msg import Float64
+from std_msgs.msg import Float64, Header
 
 # Habitat-related imports
 import habitat
@@ -50,12 +50,12 @@ from habitat.utils.visualizations.utils import (
 )
 
 # ROS message imports
-from plan_env.msg import MultipleMasksWithConfidence, SemanticScore
+from plan_env.msg import MultipleMasksWithConfidence
 
 # Local project imports
 from habitat2ros.habitat_publisher import ROSPublisherNonNode
 from vlm.utils.get_object_utils import get_object
-from vlm.utils.get_clip_similarity import get_clip_similarity
+from habitat2ros.frontier_semantics import FrontierSemanticBridge
 from llm.answer_reader.answer_reader import read_answer
 from basic_utils.object_point_cloud_utils.object_point_cloud import (
     get_object_point_cloud,
@@ -88,7 +88,7 @@ class HabitatManualNode(Node):
         self.pub_timer = None
 
         # Publishers
-        self.semantic_score_pub = self.create_publisher(SemanticScore, "/semantic/score", qos)
+        self.semantic_bridge = FrontierSemanticBridge("clip")
         self.cld_with_score_pub = self.create_publisher(
             MultipleMasksWithConfidence, "/yoloe/clouds_with_scores", qos)
         self.confidence_threshold_pub = self.create_publisher(
@@ -96,6 +96,10 @@ class HabitatManualNode(Node):
 
         # ROS Publisher for habitat topics
         self.ros_pub = ROSPublisherNonNode(self)
+
+    def destroy_node(self):
+        self.semantic_bridge.close()
+        return super().destroy_node()
 
     def publish_float64(self, publisher, data: float):
         """Publish a Float64 value to the given ROS publisher."""
@@ -233,6 +237,7 @@ def main(cfg: DictConfig, node: HabitatManualNode) -> None:
         llm_answer_path, llm_response_path, label, llm_client
     )
 
+    node.semantic_bridge.set_target(label,room,force=True)
     cld_with_score_msg = MultipleMasksWithConfidence()
     count_steps = 0
 
@@ -273,17 +278,8 @@ def main(cfg: DictConfig, node: HabitatManualNode) -> None:
 
         observations["ros_stamp"] = node.get_clock().now().to_msg()
         observations["camera_pitch"] = camera_pitch
-        node.ros_pub.habitat_publish_ros_topic(observations)
-        # Calculate CLIP cosine similarity score
-        cosine = get_clip_similarity(observations["rgb"], label, room)
-        print(f"Target related room: {room}")
-        print(f"CLIP cosine similarity: {cosine:.3f}")
-        semantic_msg = SemanticScore()
-        semantic_msg.header.stamp = observations["ros_stamp"]
-        semantic_msg.header.frame_id = "world"
-        semantic_msg.backend = "clip"
-        semantic_msg.score = float(cosine)
-        node.semantic_score_pub.publish(semantic_msg)
+        node.msg_observations = deepcopy(observations)
+        node.ros_pub.habitat_publish_ros_topic(node.msg_observations)
 
         # Detect objects in the current observation
         detect_img, score_list, object_masks_list, label_list = get_object(
@@ -292,7 +288,7 @@ def main(cfg: DictConfig, node: HabitatManualNode) -> None:
 
         observations["rgb"] = detect_img
         observations["camera_pitch"] = camera_pitch
-        node.ros_pub.habitat_publish_ros_topic(observations)
+        node.ros_pub.habitat_publish_ros_topic(node.msg_observations)
         observations["rgb"] = transform_rgb_bgr(detect_img)
         del observations["camera_pitch"]
         frame = observations_to_image(observations, info)
@@ -302,7 +298,7 @@ def main(cfg: DictConfig, node: HabitatManualNode) -> None:
             cfg, observations, object_masks_list, node
         )
 
-        cld_with_score_msg.header = semantic_msg.header
+        cld_with_score_msg.header = Header(stamp=observations["ros_stamp"],frame_id="world")
         cld_with_score_msg.point_clouds = obj_point_cloud_list
         cld_with_score_msg.confidence_scores = score_list
         cld_with_score_msg.label_indices = label_list
@@ -330,4 +326,5 @@ if __name__ == "__main__":
         rclpy.shutdown()
         os._exit(1)
     finally:
-        rclpy.shutdown()
+        if "node" in locals():node.destroy_node()
+        if rclpy.ok():rclpy.shutdown()

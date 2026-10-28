@@ -8,6 +8,7 @@
 #include <visualization_msgs/msg/marker.hpp>
 #include <std_msgs/msg/empty.hpp>
 #include <std_msgs/msg/float32.hpp>
+#include <std_srvs/srv/trigger.hpp>
 #include "controller/mpc.h"
 
 #include <chrono>
@@ -76,6 +77,26 @@ public:
     RCLCPP_INFO(this->get_logger(), "[traj_server] TrajectoryServer initialized, waiting for messages...");
 
     need_init_ = need_init;
+    reset_service_ = this->create_service<std_srvs::srv::Trigger>(
+        "/traj_server/reset",
+        [this](const std::shared_ptr<std_srvs::srv::Trigger::Request>,
+               std::shared_ptr<std_srvs::srv::Trigger::Response> response) {
+          episode_start_time_ = this->get_clock()->now();
+          receive_traj_ = false;
+          has_target_angle_ = false;
+          have_odom_ = false;
+          traj_.reset();
+          traj_real_.clear();
+          if (init_cmd_timer_) init_cmd_timer_->cancel();
+          vel_cmd_pub_->publish(geometry_msgs::msg::Twist());
+          visualization_msgs::msg::Marker clear;
+          clear.header.frame_id = "world";
+          clear.header.stamp = episode_start_time_;
+          clear.action = visualization_msgs::msg::Marker::DELETEALL;
+          traj_vis_pub_->publish(clear);
+          response->success = true;
+          response->message = "Controller stopped and traveled path cleared";
+        });
   }
 
   void initMPC()
@@ -148,6 +169,7 @@ public:
 
   void polyTrajCallback(const trajectory_manager::msg::PolyTraj::SharedPtr msg)
   {
+    if (rclcpp::Time(msg->start_time) <= episode_start_time_) return;
     if (msg->order != 7) {
       RCLCPP_ERROR(this->get_logger(), "[traj_server] Only support trajectory order equals 7 now!");
       return;
@@ -189,6 +211,7 @@ public:
 
   void odometryCallback(const nav_msgs::msg::Odometry::SharedPtr msg)
   {
+    if (rclcpp::Time(msg->header.stamp) <= episode_start_time_) return;
     odom_pos_(0) = msg->pose.pose.position.x;
     odom_pos_(1) = msg->pose.pose.position.y;
     odom_pos_(2) = msg->pose.pose.position.z;
@@ -404,6 +427,8 @@ public:
   }
 
 private:
+  rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr reset_service_;
+  rclcpp::Time episode_start_time_{0, 0, RCL_ROS_TIME};
   rclcpp::Subscription<trajectory_manager::msg::PolyTraj>::SharedPtr traj_sub_;
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_sub_;
   rclcpp::Subscription<std_msgs::msg::Empty>::SharedPtr stop_sub_;

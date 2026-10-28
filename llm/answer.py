@@ -1,15 +1,19 @@
-from llm.client.deepseek_answer import deepseek_respond
 from llm.utils.only_answer import only_answer
-from llm.client.ollama_answer import ollama_respond
+
 
 def get_answer(client, prompt=None):
-    if client.llm_client == 'deepseek':
-        respond = deepseek_respond(prompt=prompt)
-    if client.llm_client == 'ollama':
-        respond = ollama_respond(model=client.ollama, prompt=prompt)
+    backend = client.llm_client
+    if backend == 'qwen':
+        from llm.client.qwen_answer import qwen_respond
+        return qwen_respond(client.qwen, prompt)
+    elif backend == 'deepseek':
+        from llm.client.deepseek_answer import deepseek_respond
+        response = deepseek_respond(prompt=prompt)
+    elif backend == 'ollama':
+        from llm.client.ollama_answer import ollama_respond
+        response = ollama_respond(model=client.ollama, prompt=prompt)
+    elif backend == 'none':
+        return [0.5, 'everywhere'], ''
     else:
-        respond = []
-        
-    similar_answer = only_answer(respond)
-    
-    return similar_answer, respond
+        raise ValueError(f'Unknown LLM backend: {backend}')
+    return only_answer(response), response

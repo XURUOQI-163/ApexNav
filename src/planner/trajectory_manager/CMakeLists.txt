@@ -13,6 +13,7 @@ set(CMAKE_CXX_FLAGS_RELEASE "-O3 -Wall -fPIC")
 find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(std_msgs REQUIRED)
+find_package(std_srvs REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(nav_msgs REQUIRED)
@@ -54,6 +55,7 @@ target_include_directories(traj_server PUBLIC
 ament_target_dependencies(traj_server
   rclcpp
   std_msgs
+  std_srvs
   geometry_msgs
   nav_msgs
   visualization_msgs
@@ -80,6 +82,7 @@ target_include_directories(trajectory_manager_lib PUBLIC
 ament_target_dependencies(trajectory_manager_lib
   rclcpp
   std_msgs
+  std_srvs
   geometry_msgs
   visualization_msgs
   plan_env
@@ -118,6 +121,7 @@ ament_export_targets(trajectory_manager_libExport HAS_LIBRARY_TARGET)
 ament_export_dependencies(
   rclcpp
   std_msgs
+  std_srvs
   geometry_msgs
   visualization_msgs
   plan_env
