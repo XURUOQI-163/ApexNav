@@ -12,8 +12,8 @@ def main():
     args = parser.parse_args()
     client = SimpleNamespace(llm_client='qwen', qwen=SimpleNamespace())
     answer, _ = get_answer(client, args.target)
-    objects, room, threshold = validate_answer(answer)
-    print(f'Target: {args.target}\nSimilar objects: {objects}\nRoom: {room}\nThreshold: {threshold}')
+    room, threshold = validate_answer(answer)
+    print(f'Target: {args.target}\nRoom: {room}\nThreshold: {threshold}')
 
 
 if __name__ == '__main__':

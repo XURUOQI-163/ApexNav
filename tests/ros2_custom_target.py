@@ -80,7 +80,7 @@ def main():
                 stack.enter_context(patch.object(discrete.rclpy,'ok',return_value=True))
                 stack.enter_context(patch.object(discrete.rclpy,'spin_once',side_effect=spin))
                 stack.enter_context(patch.object(discrete,'reset_episode'))
-                detect=stack.enter_context(patch.object(discrete,'get_object',side_effect=lambda label,img,*a:(img,[],[],[])))
+                detect=stack.enter_context(patch.object(discrete,'get_object',side_effect=lambda label,img,*a:(img,[],[])))
                 stack.enter_context(patch.object(discrete,'get_object_point_cloud',return_value=[]))
                 stack.enter_context(patch.object(discrete,'is_on_same_floor',side_effect=AssertionError('Dataset goal used')))
                 stack.enter_context(patch.object(discrete,'write_record',side_effect=AssertionError('Evaluation record written')))

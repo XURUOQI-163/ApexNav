@@ -7,10 +7,8 @@ from llm.prompt.get_llm_answer import SYSTEM_PROMPT
 # Include the prompt in the cache identity so changes invalidate old answers.
 QWEN_PROMPT = SYSTEM_PROMPT + '''
 Return ONLY a JSON object with keys:
-"similar_objects": an array of 3 to 5 short English object names,
 "confidence": a number between 0.25 and 0.65,
 "room": one short English room name or "everywhere".
-For a descriptive target, consider its attributes when choosing confusing objects.
 Do not rewrite the target instruction. A room is only a prior, not an observed fact.
 '''
 
@@ -38,9 +36,6 @@ def qwen_respond(config, prompt):
             extra_body={'enable_thinking': False}, stream=False)
         response = completion.choices[0].message.content
         data = json.loads(response)
-        objects = data['similar_objects']
-        if not isinstance(objects, list) or not 3 <= len(objects) <= 5:
-            raise ValueError('Qwen similar_objects must contain 3 to 5 names.')
-        return objects + [data['confidence'], data['room']], response
+        return [data['confidence'], data['room']], response
     finally:
         client.close()

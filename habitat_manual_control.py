@@ -166,8 +166,6 @@ def _parse_dataset_arg():
 def main(cfg: DictConfig, node: HabitatManualNode) -> None:
     score_list = []
     object_masks_list = []
-    label_list = []
-    llm_answer = []
 
     cfg = patch_config(cfg)
     env_count = 0 if cfg.test_epi_num == -1 else cfg.test_epi_num
@@ -233,7 +231,7 @@ def main(cfg: DictConfig, node: HabitatManualNode) -> None:
 
     label = normalize_objectnav_label(label, cfg.habitat.dataset.data_path)
 
-    llm_answer, room, node.fusion_threshold = read_answer(
+    room, node.fusion_threshold = read_answer(
         llm_answer_path, llm_response_path, label, llm_client
     )
 
@@ -282,8 +280,8 @@ def main(cfg: DictConfig, node: HabitatManualNode) -> None:
         node.ros_pub.habitat_publish_ros_topic(node.msg_observations)
 
         # Detect objects in the current observation
-        detect_img, score_list, object_masks_list, label_list = get_object(
-            label, observations["rgb"], detector_cfg, llm_answer
+        detect_img, score_list, object_masks_list = get_object(
+            label, observations["rgb"], detector_cfg
         )
 
         observations["rgb"] = detect_img
@@ -301,7 +299,6 @@ def main(cfg: DictConfig, node: HabitatManualNode) -> None:
         cld_with_score_msg.header = Header(stamp=observations["ros_stamp"],frame_id="world")
         cld_with_score_msg.point_clouds = obj_point_cloud_list
         cld_with_score_msg.confidence_scores = score_list
-        cld_with_score_msg.label_indices = label_list
         node.cld_with_score_pub.publish(cld_with_score_msg)
 
         # Show updated visualization frame

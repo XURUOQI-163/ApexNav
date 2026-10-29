@@ -1,12 +1,12 @@
 # 云端千问目标先验
 
 旧实现先读取 `llm/answers/llm_answer_hm3d.txt`（MP3D 使用另一文件）。即使选择
-`llm.llm_client.llm_client=none`，命中缓存仍使用其内容；未命中则返回空相似物体、
+`llm.llm_client.llm_client=none`，命中缓存仍使用其内容；未命中则返回
 `everywhere`、0.5。`ollama` 指本地模型，和云端 API 是不同入口。
 
 云端入口是 `llm/client/qwen_answer.py`，通过已有 OpenAI SDK 调用兼容接口。
-只发送目标文本，返回相似物体、房间先验和融合阈值。相似物体成为 YOLOE 的额外
-检测类别；房间与原目标共同组成 BLIP/CLIP 提示；阈值沿原接口发送至规划器。
+只发送目标文本，返回房间先验和融合阈值。YOLOE 仅检测原目标（及其别名）；
+房间与原目标共同组成 BLIP/CLIP 提示；阈值沿原接口发送至规划器。
 原目标不会被千问改写。房间是常识先验，不能保证当前场景真的存在该房间。
 
 在运行仿真的容器终端中激活现有环境后设置密钥（输入不回显，不写进命令历史）：
@@ -54,7 +54,11 @@ python habitat_evaluation.py --mode continuous --semantic-model blip2 \
 `cache hit`、`cache saved` 及实际缓存路径。
 
 请求异常不缓存；离散入口会报错退出。连续入口沿用已有容错：记录
-`Failed to read target context`，该目标退回空相似物体/`everywhere`/0.5；
+`Failed to read target context`，该目标退回`everywhere`/0.5；
 修好网络或配置后需重新启动任务才能再次尝试同一目标。不能把这种情况当成千问成功。
 
 代码检查使用模拟 API，无需密钥。实际 API 连通性和模型权限请用上面的检查命令验证。
+
+已移除相似类别推理与检测，预置缓存现在只保存 `[阈值, 房间]`。
+千问因提示词变化自动启用新缓存，不读取旧版本回答。
+已有自定义缓存若仍为旧格式会提示并跳过；在线后端重新请求，`none` 使用默认先验。

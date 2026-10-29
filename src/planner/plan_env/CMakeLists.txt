@@ -115,4 +115,12 @@ ament_export_dependencies(
   tf2_ros
 )
 
+if(BUILD_TESTING)
+  enable_testing()
+  add_executable(target_object_fusion_test ../../../tests/target_object_fusion.cpp)
+  target_link_libraries(target_object_fusion_test plan_env_lib)
+  add_test(NAME target_object_fusion COMMAND target_object_fusion_test)
+  set_tests_properties(target_object_fusion PROPERTIES ENVIRONMENT "ROS_DOMAIN_ID=94" TIMEOUT 30)
+endif()
+
 ament_package()

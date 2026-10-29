@@ -541,9 +541,8 @@ void ExplorationFSM::visualize()
   // Draw object
   static int last_obj_num = 0;
   for (int i = 0; i < (int)ed_ptr->objects_.size(); ++i) {
-    int label = ed_ptr->object_labels_[i];
     visualization_->drawCubes(vec2dTo3d(ed_ptr->objects_[i]), fp_->vis_scale_,
-        visualization_->getColor(double(label) / 5.0, 1.0), "object", i, 4);
+        visualization_->getColor(0.0, 1.0), "object", i, 4);
   }
   for (int i = ed_ptr->objects_.size(); i < last_obj_num; ++i) {
     visualization_->drawCubes({}, fp_->vis_scale_, Vector4d(0, 0, 0, 1), "object", i, 4);
@@ -592,7 +591,7 @@ bool ExplorationFSM::updateFrontierAndObject()
   change_flag |= frt_map->dormantSeenFrontiers(start_pos2d, fd_->start_yaw_(0));
   frt_map->getFrontiers(ed->frontiers_, ed->frontier_averages_);
   frt_map->getDormantFrontiers(ed->dormant_frontiers_, ed->dormant_frontier_averages_);
-  obj_map->getObjects(ed->objects_, ed->object_averages_, ed->object_labels_);
+  obj_map->getObjects(ed->objects_, ed->object_averages_);
   frt_map->acknowledgeChanges();
 
   return change_flag;

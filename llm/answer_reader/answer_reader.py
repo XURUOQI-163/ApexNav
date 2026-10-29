@@ -9,16 +9,14 @@ from llm.answer import get_answer
 
 
 def validate_answer(answer):
-    if not isinstance(answer, list) or len(answer) < 2:
-        raise ValueError('LLM answer must contain object names, confidence and room.')
-    objects, score, room = answer[:-2], answer[-2], answer[-1]
-    if any(not isinstance(x, str) or not x.strip() or '\n' in x for x in objects):
-        raise ValueError('LLM similar objects must be nonempty single-line strings.')
+    if not isinstance(answer, list) or len(answer) != 2:
+        raise ValueError('LLM answer must contain only confidence and room.')
+    score, room = answer
     if not isinstance(room, str) or not room.strip() or '\n' in room:
         raise ValueError('LLM room must be a nonempty single-line string.')
     if isinstance(score, bool) or not isinstance(score, (int, float)) or not math.isfinite(score) or not .25 <= score <= .65:
         raise ValueError('LLM confidence must be finite and between 0.25 and 0.65.')
-    return objects, room, float(score)
+    return room, float(score)
 
 
 def cache_paths(answer_path, response_path, client):
@@ -40,11 +38,15 @@ def read_answer(llm_answer_path, llm_response_path, label, llm_client):
         # Latest entry wins after an explicit refresh. literal_eval never executes code.
         for line in reversed(answer_path.read_text(encoding='utf-8').splitlines()):
             if line.startswith(f'{label}:'):
-                result = validate_answer(ast.literal_eval(line[len(label)+1:].strip()))
+                try:
+                    result = validate_answer(ast.literal_eval(line[len(label)+1:].strip()))
+                except (ValueError, SyntaxError):
+                    print(f'[LLM] skipping obsolete/invalid context for {label} in {answer_path}', flush=True)
+                    continue
                 print(f'[LLM {llm_client.llm_client}] cache hit: {label} ({answer_path})', flush=True)
                 return result
     if llm_client.llm_client == 'none':
-        return [], 'everywhere', 0.5
+        return 'everywhere', 0.5
     print(f'[LLM {llm_client.llm_client}] requesting context: {label}', flush=True)
     answer, response = get_answer(prompt=label, client=llm_client)
     result = validate_answer(answer)  # Never persist malformed responses.
@@ -56,5 +58,5 @@ def read_answer(llm_answer_path, llm_response_path, label, llm_client):
         with response_path.open('a', encoding='utf-8') as output:
             output.write(json.dumps({'target': label, 'response': response}, ensure_ascii=False)+'\n')
         print(f'[LLM {llm_client.llm_client}] cache saved: {answer_path}', flush=True)
-    print(f'[LLM context] similar={result[0]} room={result[1]} threshold={result[2]}', flush=True)
+    print(f'[LLM context] room={result[0]} threshold={result[1]}', flush=True)
     return result

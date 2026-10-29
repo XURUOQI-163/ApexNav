@@ -16,7 +16,7 @@
 Habitat RGB → 两个 HTTP 服务 → Python 把 YOLOE 掩码与 Habitat 深度、位姿转换为点云 → ROS2 发布 → C++ 地图与规划。
 CLIP 输出原始余弦相似度 [-1, 1]，不生成匹配概率。地图中的负分处理沿用原逻辑。
 YOLOE 的 boxes 为归一化 XYXY，masks 必须与原始 RGB 高宽相同；没有实例时返回空列表。
-每个点云、分数与类别索引一一对应，目标及目标别名为 0，相关物体为正整数。
+每个目标实例的点云与检测置信度一一对应，不再传递类别编号。
 `/detector/confidence_threshold` 仍是规划器的物体融合阈值，和 YOLOE 的检测阈值是不同参数。
 
 旧模型的 Python 模块、配置键与旧话题已移除。CLIP 使用新的 `/clip` 接口与 `cosine` 字段，
@@ -204,5 +204,15 @@ python habitat_evaluation.py --dataset hm3dv2 test_epi_num=10 \
 `config/habitat_eval_*.yaml` 使用 `detector.yoloe.confidence_threshold`、`iou_threshold`、`agnostic_nms`。
 评测 episode 上限和步长沿用 ROS2 工程。YOLOE/CLIP 的数值分布不同于原模型，
 LLM 答案缓存中的融合阈值尚未针对新模型标定；正式对比导航指标前应重新评测。
-接口测试覆盖序列化、掩码尺寸、类别对齐、空检测、负余弦分数和服务错误处理，
+接口测试覆盖序列化、掩码尺寸、目标别名与掩码对齐、空检测、负余弦分数和服务错误处理，
 不等价于 Jazzy C++ 构建或真实 GPU/Habitat 端到端验证。
+
+## 仅目标检测
+
+YOLOE 导航调用只请求目标描述及其 `|` 分隔的别名，不再请求相似类别。
+`get_object` 返回标注图、目标置信度列表和目标掩码列表。
+`/yoloe/clouds_with_scores` 保留采集时间戳、点云与置信度，删除 `label_indices`。
+C++ 每个目标实例只保存一套点云和融合证据，保留多帧加权融合、观测次数门槛、
+漏检观测更新和目标后备搜索。房间先验、前沿语义窗口及其时间对齐保持原流程。
+
+更新后必须重启规划器与仿真/感知进程，避免混用旧消息格式；启动命令不变。

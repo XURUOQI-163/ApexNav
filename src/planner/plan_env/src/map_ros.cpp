@@ -373,8 +373,7 @@ void MapROS::detectedObjectCloudCallback(const plan_env::msg::MultipleMasksWithC
   const auto& camera_pos_ = observation->camera_pos3;
   const auto& camera_q_ = observation->camera_q;
   // Validate message structure consistency
-  if (!(msg->confidence_scores.size() == msg->point_clouds.size() &&
-          msg->confidence_scores.size() == msg->label_indices.size())) {
+  if (msg->confidence_scores.size() != msg->point_clouds.size()) {
     RCLCPP_ERROR(node_->get_logger(), "[Bug] The MultipleMasksWithConfidence msg is wrong!!!");
     return;
   }
@@ -405,7 +404,6 @@ void MapROS::detectedObjectCloudCallback(const plan_env::msg::MultipleMasksWithC
   for (size_t i = 0; i < msg->confidence_scores.size(); i++) {
     auto cloud = msg->point_clouds[i];
     auto confidence_score = msg->confidence_scores[i];
-    auto label = msg->label_indices[i];
 
     // Convert ROS2 message to PCL point cloud
     PointCloud3D::Ptr single_object_cloud(new PointCloud3D());
@@ -423,9 +421,8 @@ void MapROS::detectedObjectCloudCallback(const plan_env::msg::MultipleMasksWithC
     for (auto object_pt : single_object_cloud->points) {
       Eigen::Vector3d object_pt3d = Eigen::Vector3d(object_pt.x, object_pt.y, object_pt.z);
       if ((object_pt3d - camera_pos_).norm() > depth_filter_maxdist_ - 0.10) {
-        // Store over-depth points for target objects (label == 0) for tracking consistency
-        if (label == 0)
-          over_depth_object_cloud->points.push_back(object_pt);
+        // Store over-depth target points for tracking consistency
+        over_depth_object_cloud->points.push_back(object_pt);
         continue;
       }
       tmp_object_cloud->points.push_back(object_pt);
@@ -458,7 +455,6 @@ void MapROS::detectedObjectCloudCallback(const plan_env::msg::MultipleMasksWithC
     DetectedObject detected_object;
     detected_object.cloud = single_object_cloud;
     detected_object.score = confidence_score;
-    detected_object.label = label;
     detected_objects.push_back(detected_object);
   }
 

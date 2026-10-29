@@ -1,9 +1,9 @@
 from ollama import chat
 from ollama import ChatResponse
-from llm.utils.get_sys_prompt import get_similar_answer_prompt
+from llm.utils.get_sys_prompt import get_context_prompt
 
 def ollama_respond(model, prompt):
-    system_prompts = get_similar_answer_prompt()
+    system_prompts = get_context_prompt()
     msg = {
         "role": "user",
         "content": prompt,

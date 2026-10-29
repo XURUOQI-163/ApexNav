@@ -111,7 +111,6 @@ class RealWorldNode(Node):
         # Label will be provided via ROS topic `/detector/label` (std_msgs/String)
         # Initialize empty/defaults; actual values will be set in `label_callback`.
         self.label = None
-        self.llm_answer = []
         self.room = None
         self.fusion_score = 0.0
 
@@ -146,7 +145,6 @@ class RealWorldNode(Node):
             cld_with_score_msg.header = rgb_msg.header
             cld_with_score_msg.point_clouds = []
             cld_with_score_msg.confidence_scores = []
-            cld_with_score_msg.label_indices = []
             self.get_logger().info(f"detect: label: {self.label}")
 
             # If label not yet received, skip detection until available
@@ -154,8 +152,8 @@ class RealWorldNode(Node):
                 self.get_logger().warn("Waiting for target label on /detector/label")
                 return
 
-            detect_img, score_list, object_masks_list, label_list = get_object(
-                self.label, rgb_cv, self.config.detector, self.llm_answer
+            detect_img, score_list, object_masks_list = get_object(
+                self.label, rgb_cv, self.config.detector
             )
 
             # Use inverse transform to recover original Habitat observations format
@@ -172,7 +170,6 @@ class RealWorldNode(Node):
             )
             cld_with_score_msg.point_clouds = obj_point_cloud_list
             cld_with_score_msg.confidence_scores = score_list
-            cld_with_score_msg.label_indices = label_list
             # Publish the detection image for visualization
             self.detect_img_pub_.publish(
                 self.bridge.cv2_to_imgmsg(detect_img, encoding="rgb8")
@@ -196,13 +193,12 @@ class RealWorldNode(Node):
             self.get_logger().info(f"Received target label: {self.label}")
             # If LLM is configured, fetch LLM answer for the new label
             try:
-                self.llm_answer, self.room, self.fusion_score = read_answer(
+                self.room, self.fusion_score = read_answer(
                     self.llm_answer_path, self.llm_response_path, self.label, self.llm_client
                 )
             except Exception as exc:
                 self.get_logger().error(f"Failed to read target context: {exc}")
-                # Keep scene guidance usable without related-object hints.
-                self.llm_answer = []
+                # Fall back to neutral room context and the default target threshold.
                 self.room = "everywhere"
                 self.fusion_score = 0.5
             self.semantic_bridge.set_target(self.label,self.room)

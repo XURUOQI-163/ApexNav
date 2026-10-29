@@ -111,7 +111,7 @@ python habitat_evaluation.py --mode continuous --semantic-model blip2 \
 - 指定 `--target` 后，两种模式都只运行一个场景。`test_epi_num` 是 episode 列表的零基索引，
   用于选择场景和初始位姿；省略时选择索引 0。不会按原数据集目标的楼层条件跳过场景。
 - 自定义试跑不输出或写入原目标的 Success/SPL 结果；仍受步数/时间预算和规划器停止指令控制。
-- 新描述可以配合 `llm_client=none` 直接使用。没有缓存上下文时，使用空相似物体列表、
+- 新描述可以配合 `llm_client=none` 直接使用。没有缓存上下文时，使用
   `everywhere` 和现有默认目标融合阈值 0.5，不调用 LLM。
 - 描述用引号包住，作为独立参数传递，不经过 Hydra override 语法解析。
   支持字符串原样传递，但没有自动翻译；当前提示模板为英文，试跑可先使用英文物体短语。

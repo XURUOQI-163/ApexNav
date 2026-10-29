@@ -93,51 +93,45 @@ void ObjectMap2D::inputObservationObjectsCloud(
     if (observation_cloud->points.empty())
       continue;
 
-    // Check overlap with each possible object classification
-    for (int label = 0; label < 5; ++label) {
-      if (object.confidence_scores_[label] < 1e-3)
-        continue;  // Skip labels with negligible confidence
+    // Check overlap with the target observation
+    if (object.confidence_ < 1e-3)
+      continue;  // Skip negligible target confidence
 
-      // Setup spatial search for overlap computation
-      pcl::KdTreeFLANN<pcl::PointXYZ> kdtree;
-      kdtree.setInputCloud(observation_cloud);
-      double distance_threshold = leaf_size_ * 1.1;  // Spatial overlap threshold
-      int overlap_count = 0;
+    // Setup spatial search for overlap computation
+    pcl::KdTreeFLANN<pcl::PointXYZ> kdtree;
+    kdtree.setInputCloud(observation_cloud);
+    double distance_threshold = leaf_size_ * 1.1;  // Spatial overlap threshold
+    int overlap_count = 0;
 
-      // Count overlapping points between object and observation clouds
-      for (const auto& point : object.clouds_[label]->points) {
-        std::vector<int> point_idx_search;
-        std::vector<float> point_squared_distance;
-        if (kdtree.nearestKSearch(point, 1, point_idx_search, point_squared_distance) > 0) {
-          // Points within threshold are considered overlapping
-          if (point_squared_distance[0] <= distance_threshold * distance_threshold) {
-            overlap_count++;
-          }
+    // Count overlapping points between object and observation clouds
+    for (const auto& point : object.cloud_->points) {
+      std::vector<int> point_idx_search;
+      std::vector<float> point_squared_distance;
+      if (kdtree.nearestKSearch(point, 1, point_idx_search, point_squared_distance) > 0) {
+        // Points within threshold are considered overlapping
+        if (point_squared_distance[0] <= distance_threshold * distance_threshold) {
+          overlap_count++;
         }
       }
-
-      // Skip if no spatial overlap detected
-      if (overlap_count == 0)
-        continue;
-
-      // Update confidence scores based on negative observation evidence
-      auto& merged_object = objects_[i];
-      merged_object.observation_cloud_sums_[label] += overlap_count;
-      int total_last = merged_object.clouds_[label]->points.size();
-      double confidence_last = merged_object.confidence_scores_[label];
-      int observation_now = overlap_count;
-      double confidence_now = 0.0;  // Negative evidence has zero confidence
-      if (label == 0)
-        confidence_now = clip_score;  // Use CLIP score for primary label
-      int total_now = merged_object.clouds_[label]->points.size();
-
-      // Apply confidence fusion algorithm
-      merged_object.confidence_scores_[label] = fusionConfidenceScore(total_last, confidence_last,
-          observation_now, confidence_now, total_now, merged_object.observation_cloud_sums_[label]);
-      printFusionInfo(merged_object, label, "[Observation]");
-      // ROS_WARN("[Observation] id = %d label = %d overlap_count = %d object_cloud = %ld",
-      //     merged_object.id_, label, overlap_count, object.clouds_[label]->points.size());
     }
+
+    // Skip if no spatial overlap detected
+    if (overlap_count == 0)
+      continue;
+
+    // Update confidence scores based on negative observation evidence
+    auto& merged_object = objects_[i];
+    merged_object.observed_points_ += overlap_count;
+    int total_last = merged_object.cloud_->points.size();
+    double confidence_last = merged_object.confidence_;
+    int observation_now = overlap_count;
+    double confidence_now = clip_score;  // Matched target semantic observation
+    int total_now = merged_object.cloud_->points.size();
+
+    // Apply confidence fusion algorithm
+    merged_object.confidence_ = fusionConfidenceScore(total_last, confidence_last,
+        observation_now, confidence_now, total_now, merged_object.observed_points_);
+    printFusionInfo(merged_object, "[Observation]");
   }
 }
 
@@ -213,8 +207,7 @@ int ObjectMap2D::searchSingleObjectCluster(const DetectedObject& detected_object
     obj_idx = object_indexs_[toAdr(object_point2Ds[0])];
   }
 
-  // Update classification and visualization
-  updateObjectBestLabel(obj_idx);
+  // Update visualization
   if (is_vis_cloud_)
     publishObjectClouds();
 
@@ -227,29 +220,10 @@ int ObjectMap2D::searchSingleObjectCluster(const DetectedObject& detected_object
   return obj_idx;
 }
 
-void ObjectMap2D::updateObjectBestLabel(int obj_idx)
-{
-  double max_func_score = 0.1;  // Minimum threshold for valid classification
-  int best_label = -1;
-
-  // Evaluate each possible classification label
-  for (int label = 0; label < (int)objects_[obj_idx].clouds_.size(); label++) {
-    auto obs_sum = objects_[obj_idx].observation_cloud_sums_[label];
-    auto score = objects_[obj_idx].confidence_scores_[label];
-    int func_score = obs_sum * score;  // Combined reliability metric
-
-    if (func_score > max_func_score) {
-      max_func_score = func_score;
-      best_label = label;
-    }
-  }
-  objects_[obj_idx].best_label_ = best_label;
-}
 
 void ObjectMap2D::createNewObjectCluster(
     const std::vector<Eigen::Vector2d>& cells, const DetectedObject& detected_object)
 {
-  int label = detected_object.label;
 
   // Initialize new object cluster with unique ID
   ObjectCluster obj;
@@ -257,7 +231,6 @@ void ObjectMap2D::createNewObjectCluster(
   obj.max_seen_count_ = 0;
   obj.good_cells_.clear();
   obj.seen_counts_.clear();
-  obj.best_label_ = -1;
 
   // Process spatial cells and establish grid associations
   std::vector<Eigen::Vector2d> real_new_cells;
@@ -266,12 +239,10 @@ void ObjectMap2D::createNewObjectCluster(
     object_indexs_[adr] = obj.id_;  // Associate grid cell with object
     obj.visited_[adr] = 1;
 
-    // Track high-confidence observations for label 0
-    if (label == 0) {
-      obj.seen_counts_[adr] = 1;
-      obj.max_seen_count_ = 1;
-      obj.good_cells_.push_back(cell);
-    }
+    // Track target observations
+    obj.seen_counts_[adr] = 1;
+    obj.max_seen_count_ = 1;
+    obj.good_cells_.push_back(cell);
   }
 
   // Compute spatial properties of the object cluster
@@ -289,18 +260,18 @@ void ObjectMap2D::createNewObjectCluster(
   }
   obj.average_ /= double(obj.cells_.size());
 
-  // Initialize point cloud storage for the detected label
-  obj.clouds_[label].reset(new pcl::PointCloud<pcl::PointXYZ>());
-  *obj.clouds_[label] = *detected_object.cloud;
+  // Initialize target point cloud storage
+  obj.cloud_.reset(new pcl::PointCloud<pcl::PointXYZ>());
+  *obj.cloud_ = *detected_object.cloud;
 
   // Compute 3D bounding box from point cloud
-  if (!obj.clouds_[label]->points.empty()) {
-    obj.box_max3d_ = Vector3d(obj.clouds_[label]->points[0].x, obj.clouds_[label]->points[0].y,
-        obj.clouds_[label]->points[0].z);
-    obj.box_min3d_ = Vector3d(obj.clouds_[label]->points[0].x, obj.clouds_[label]->points[0].y,
-        obj.clouds_[label]->points[0].z);
+  if (!obj.cloud_->points.empty()) {
+    obj.box_max3d_ = Vector3d(obj.cloud_->points[0].x, obj.cloud_->points[0].y,
+        obj.cloud_->points[0].z);
+    obj.box_min3d_ = Vector3d(obj.cloud_->points[0].x, obj.cloud_->points[0].y,
+        obj.cloud_->points[0].z);
 
-    for (auto pt : obj.clouds_[label]->points) {
+    for (auto pt : obj.cloud_->points) {
       Vector3d vec_pt = Vector3d(pt.x, pt.y, pt.z);
       for (int i = 0; i < 3; ++i) {
         obj.box_min3d_[i] = min(obj.box_min3d_[i], vec_pt[i]);
@@ -310,19 +281,18 @@ void ObjectMap2D::createNewObjectCluster(
   }
 
   // Initialize confidence tracking for this object
-  obj.confidence_scores_[label] = detected_object.score;
-  obj.observation_cloud_sums_[label] = detected_object.cloud->points.size();
-  obj.observation_nums_[label] = 1;
+  obj.confidence_ = detected_object.score;
+  obj.observed_points_ = detected_object.cloud->points.size();
+  obj.observation_count_ = 1;
 
   // Add to global object registry
   objects_.push_back(obj);
-  printFusionInfo(obj, label, "[New Object Cluster]");
+  printFusionInfo(obj, "[New Object Cluster]");
 }
 
 void ObjectMap2D::mergeCellsIntoObjectCluster(const int& merged_object_id,
     const std::vector<Eigen::Vector2d>& new_cells, const DetectedObject& detected_object)
 {
-  int label = detected_object.label;
   const auto last_objects = objects_;
 
   ObjectCluster& merged_object = objects_[merged_object_id];
@@ -339,36 +309,32 @@ void ObjectMap2D::mergeCellsIntoObjectCluster(const int& merged_object_id,
       merged_object.visited_[adr] = 1;
     }
 
-    // Track observation frequency for high-confidence detections (label 0)
-    if (label == 0) {
-      if (merged_object.seen_counts_.count(adr))
-        merged_object.seen_counts_[adr] += 1;
-      else
-        merged_object.seen_counts_[adr] = 1;
+    // Track target observation frequency
+    if (merged_object.seen_counts_.count(adr))
+      merged_object.seen_counts_[adr] += 1;
+    else
+      merged_object.seen_counts_[adr] = 1;
 
-      // Update maximum observation count for this cluster
-      if (merged_object.seen_counts_[adr] > merged_object.max_seen_count_)
-        merged_object.max_seen_count_ = merged_object.seen_counts_[adr];
-    }
+    // Update maximum observation count for this cluster
+    if (merged_object.seen_counts_[adr] > merged_object.max_seen_count_)
+      merged_object.max_seen_count_ = merged_object.seen_counts_[adr];
   }
 
   // Extend cluster's spatial coverage
   merged_object.cells_.insert(
       merged_object.cells_.end(), real_new_cells.begin(), real_new_cells.end());
 
-  // Update high-confidence cell tracking for label 0
-  if (label == 0) {
-    merged_object.good_cells_.clear();
-    for (auto cell : merged_object.cells_) {
-      int adr = toAdr(cell);
-      if (merged_object.seen_counts_.count(adr)) {
-        // Cells with sufficient observations are considered "good"
-        if (merged_object.seen_counts_[adr] >= min(4, merged_object.max_seen_count_))
-          merged_object.good_cells_.push_back(cell);
-      }
+  // Update target cell observation counts
+  merged_object.good_cells_.clear();
+  for (auto cell : merged_object.cells_) {
+    int adr = toAdr(cell);
+    if (merged_object.seen_counts_.count(adr)) {
+      // Cells with sufficient observations are considered "good"
+      if (merged_object.seen_counts_[adr] >= min(4, merged_object.max_seen_count_))
+        merged_object.good_cells_.push_back(cell);
     }
-    RCLCPP_ERROR(node_->get_logger(), "merged_object good cells size = %ld", merged_object.good_cells_.size());
   }
+  RCLCPP_ERROR(node_->get_logger(), "merged_object good cells size = %ld", merged_object.good_cells_.size());
 
   // Recompute spatial properties
   merged_object.average_.setZero();
@@ -384,84 +350,74 @@ void ObjectMap2D::mergeCellsIntoObjectCluster(const int& merged_object_id,
   merged_object.average_ /= double(merged_object.cells_.size());
 
   // Handle point cloud fusion based on observation history
-  if (!merged_object.observation_nums_[label]) {
-    // First observation of this label - initialize directly
-    merged_object.clouds_[label].reset(new pcl::PointCloud<pcl::PointXYZ>());
-    *merged_object.clouds_[label] = *(detected_object.cloud);
-    merged_object.confidence_scores_[label] = detected_object.score;
-    merged_object.observation_cloud_sums_[label] = detected_object.cloud->points.size();
-    merged_object.observation_nums_[label] = 1;
-    printFusionInfo(merged_object, label, "[New Label Merged]");
+  // Merge with existing observations using point cloud fusion
+  pcl::PointCloud<pcl::PointXYZ>::Ptr merged_cloud(new pcl::PointCloud<pcl::PointXYZ>());
+  if (!merged_object.cloud_ || merged_object.cloud_->points.empty()) {
+    RCLCPP_WARN(node_->get_logger(), "Target cloud is null or empty before merge, reinitializing");
+    merged_object.cloud_.reset(new pcl::PointCloud<pcl::PointXYZ>());
   }
-  else {
-    // Merge with existing observations using point cloud fusion
-    pcl::PointCloud<pcl::PointXYZ>::Ptr merged_cloud(new pcl::PointCloud<pcl::PointXYZ>());
-    if (!merged_object.clouds_[label] || merged_object.clouds_[label]->points.empty()) {
-      RCLCPP_WARN(node_->get_logger(), "clouds_[%d] is null or empty before merge, reinitializing", label);
-      merged_object.clouds_[label].reset(new pcl::PointCloud<pcl::PointXYZ>());
-    }
-    *merged_cloud = *(merged_object.clouds_[label]);  // Copy existing cloud
-    *merged_cloud += *(detected_object.cloud);        // Add new observations
+  *merged_cloud = *(merged_object.cloud_);  // Copy existing cloud
+  *merged_cloud += *(detected_object.cloud);        // Add new observations
 
-    // Apply voxel grid downsampling to manage point cloud size
-    pcl::VoxelGrid<pcl::PointXYZ> voxel_filter;
-    voxel_filter.setInputCloud(merged_cloud);
-    voxel_filter.setLeafSize(leaf_size_, leaf_size_, leaf_size_);
-    voxel_filter.filter(*merged_cloud);
-    merged_object.clouds_[label] = merged_cloud;
+  // Apply voxel grid downsampling to manage point cloud size
+  pcl::VoxelGrid<pcl::PointXYZ> voxel_filter;
+  voxel_filter.setInputCloud(merged_cloud);
+  voxel_filter.setLeafSize(leaf_size_, leaf_size_, leaf_size_);
+  voxel_filter.filter(*merged_cloud);
+  merged_object.cloud_ = merged_cloud;
 
-    // Guard against empty cloud after voxel filtering
-    if (merged_object.clouds_[label]->points.empty()) {
-      RCLCPP_WARN(node_->get_logger(), "Empty cloud after voxel filter for label %d, skipping update", label);
-      merged_object.observation_nums_[label]++;
-      merged_object.observation_cloud_sums_[label] += detected_object.cloud->points.size();
-      merged_object.confidence_scores_[label] = detected_object.score;
-      printFusionInfo(merged_object, label, "[Fusion-EmptyCloud]");
-      return;
-    }
-
-    // Update 3D bounding box from merged point cloud
-    merged_object.box_max3d_ = Vector3d(merged_object.clouds_[label]->points[0].x,
-        merged_object.clouds_[label]->points[0].y, merged_object.clouds_[label]->points[0].z);
-    merged_object.box_min3d_ = Vector3d(merged_object.clouds_[label]->points[0].x,
-        merged_object.clouds_[label]->points[0].y, merged_object.clouds_[label]->points[0].z);
-
-    for (auto pt : merged_object.clouds_[label]->points) {
-      Vector3d vec_pt = Vector3d(pt.x, pt.y, pt.z);
-      for (int i = 0; i < 3; ++i) {
-        merged_object.box_min3d_[i] = min(merged_object.box_min3d_[i], vec_pt[i]);
-        merged_object.box_max3d_[i] = max(merged_object.box_max3d_[i], vec_pt[i]);
-      }
-    }
-
-    // Update observation tracking
-    merged_object.observation_nums_[label]++;
-    merged_object.observation_cloud_sums_[label] += detected_object.cloud->points.size();
-
-    // Prepare confidence fusion parameters
-    int last_total = 0;
-    double last_total_confidence = 0.0;
-    if (last_objects[merged_object_id].clouds_[label] &&
-        !last_objects[merged_object_id].clouds_[label]->points.empty()) {
-      last_total = last_objects[merged_object_id].clouds_[label]->points.size();
-      last_total_confidence = last_objects[merged_object_id].confidence_scores_[label];
-    }
-    int now_observation = detected_object.cloud->points.size();
-    double now_confidence = detected_object.score;
-    int now_total = merged_object.clouds_[label]->points.size();
-
-    // Apply confidence fusion strategy based on fusion type
-    if (fusion_type_ == 0)
-      merged_object.confidence_scores_[label] = now_confidence;  // Replace with current
-    else if (fusion_type_ == 1)
-      merged_object.confidence_scores_[label] =
-          fusionConfidenceScore(last_total, last_total_confidence, now_observation, now_confidence,
-              now_total, merged_object.observation_cloud_sums_[label]);  // Weighted fusion
-    else if (fusion_type_ == 2)
-      merged_object.confidence_scores_[label] =
-          max(merged_object.confidence_scores_[label], now_confidence);  // Maximum confidence
-    printFusionInfo(merged_object, label, "[Fusion]");
+  // Guard against empty cloud after voxel filtering
+  if (merged_object.cloud_->points.empty()) {
+    RCLCPP_WARN(node_->get_logger(), "Empty target cloud after voxel filter, skipping update");
+    merged_object.observation_count_++;
+    merged_object.observed_points_ += detected_object.cloud->points.size();
+    merged_object.confidence_ = detected_object.score;
+    printFusionInfo(merged_object, "[Fusion-EmptyCloud]");
+    return;
   }
+
+  // Update 3D bounding box from merged point cloud
+  merged_object.box_max3d_ = Vector3d(merged_object.cloud_->points[0].x,
+      merged_object.cloud_->points[0].y, merged_object.cloud_->points[0].z);
+  merged_object.box_min3d_ = Vector3d(merged_object.cloud_->points[0].x,
+      merged_object.cloud_->points[0].y, merged_object.cloud_->points[0].z);
+
+  for (auto pt : merged_object.cloud_->points) {
+    Vector3d vec_pt = Vector3d(pt.x, pt.y, pt.z);
+    for (int i = 0; i < 3; ++i) {
+      merged_object.box_min3d_[i] = min(merged_object.box_min3d_[i], vec_pt[i]);
+      merged_object.box_max3d_[i] = max(merged_object.box_max3d_[i], vec_pt[i]);
+    }
+  }
+
+  // Update observation tracking
+  merged_object.observation_count_++;
+  merged_object.observed_points_ += detected_object.cloud->points.size();
+
+  // Prepare confidence fusion parameters
+  int last_total = 0;
+  double last_total_confidence = 0.0;
+  if (last_objects[merged_object_id].cloud_ &&
+      !last_objects[merged_object_id].cloud_->points.empty()) {
+    last_total = last_objects[merged_object_id].cloud_->points.size();
+    last_total_confidence = last_objects[merged_object_id].confidence_;
+  }
+  int now_observation = detected_object.cloud->points.size();
+  double now_confidence = detected_object.score;
+  int now_total = merged_object.cloud_->points.size();
+
+  // Apply confidence fusion strategy based on fusion type
+  if (fusion_type_ == 0)
+    merged_object.confidence_ = now_confidence;  // Replace with current
+  else if (fusion_type_ == 1)
+    merged_object.confidence_ =
+        fusionConfidenceScore(last_total, last_total_confidence, now_observation, now_confidence,
+            now_total, merged_object.observed_points_);  // Weighted fusion
+  else if (fusion_type_ == 2)
+    merged_object.confidence_ =
+        max(merged_object.confidence_, now_confidence);  // Maximum confidence
+  printFusionInfo(merged_object, "[Fusion]");
+
 }
 
 /**
@@ -507,15 +463,13 @@ bool ObjectMap2D::checkSafety(const Eigen::Vector2d& pos)
 }
 
 void ObjectMap2D::getObjects(
-    vector<vector<Eigen::Vector2d>>& clusters, vector<Vector2d>& averages, vector<int>& labels)
+    vector<vector<Eigen::Vector2d>>& clusters, vector<Vector2d>& averages)
 {
   clusters.clear();
   averages.clear();
-  labels.clear();
   for (auto object : objects_) {
     clusters.push_back(object.cells_);
     averages.push_back(object.average_);
-    labels.push_back(object.best_label_);
   }
 }
 
@@ -556,7 +510,7 @@ void ObjectMap2D::getAllConfidenceObjectClouds(
 
   // Extract high-confidence object cells
   for (auto object : objects_) {
-    if (object.confidence_scores_[0] >= min_confidence_) {
+    if (object.confidence_ >= min_confidence_) {
       for (auto cell : object.good_cells_) {
         pcl::PointXYZ point;
         point.x = cell[0];
@@ -584,12 +538,12 @@ void ObjectMap2D::getTopConfidenceObjectCloud(
     // Sort by confidence score in descending order
     std::sort(
         top_objects.begin(), top_objects.end(), [](const ObjectCluster& a, const ObjectCluster& b) {
-          return a.confidence_scores_[0] > b.confidence_scores_[0];
+          return a.confidence_ > b.confidence_;
         });
 
     // Extract point clouds for top-ranked objects
     for (auto top_obj : top_objects) {
-      if (top_obj.confidence_scores_[0] <= 0.01)
+      if (top_obj.confidence_ <= 0.01)
         break;  // Skip extremely low confidence objects
 
       pcl::shared_ptr<pcl::PointCloud<pcl::PointXYZ>> top_object_cloud;
@@ -624,30 +578,16 @@ void ObjectMap2D::getTopConfidenceObjectCloud(
     }
   }
   else {
-    // Apply confidence filtering with functional scoring
+    // Apply target confidence and observation-count thresholds
     for (auto object : objects_) {
-      int max_func_score = 0, best_label = -1;
-
-      // Find best label using functional score (observation count * confidence)
-      for (int label = 0; label < (int)object.clouds_.size(); label++) {
-        auto obs_sum = object.observation_cloud_sums_[label];
-        auto score = object.confidence_scores_[label];
-        int func_score = obs_sum * score;
-        if (func_score > max_func_score) {
-          max_func_score = func_score;
-          best_label = label;
-        }
-      }
-
-      // Include only high-confidence objects with primary label (0)
-      if (best_label == 0 && isConfidenceObject(object))
+      if (isConfidenceObject(object))
         top_objects.push_back(object);
     }
 
     // Sort filtered objects by confidence
     std::sort(
         top_objects.begin(), top_objects.end(), [](const ObjectCluster& a, const ObjectCluster& b) {
-          return a.confidence_scores_[0] > b.confidence_scores_[0];
+          return a.confidence_ > b.confidence_;
         });
 
     // Extract point clouds from filtered objects
@@ -668,8 +608,8 @@ void ObjectMap2D::getTopConfidenceObjectCloud(
 
 bool ObjectMap2D::isConfidenceObject(const ObjectCluster& obj)
 {
-  if (obj.confidence_scores_[0] >= min_confidence_ &&
-      obj.observation_nums_[0] >= min_observation_num_)
+  if (obj.confidence_ >= min_confidence_ &&
+      obj.observation_count_ >= min_observation_num_)
     return true;
   return false;
 }

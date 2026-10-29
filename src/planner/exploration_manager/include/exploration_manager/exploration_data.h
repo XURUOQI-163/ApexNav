@@ -119,7 +119,6 @@ struct ExplorationData {
     dormant_frontier_averages_.clear();
     objects_.clear();
     object_averages_.clear();
-    object_labels_.clear();
     next_pos_ = Eigen::Vector2d(0, 0);
     next_best_path_.clear();
     tsp_tour_.clear();
@@ -128,7 +127,6 @@ struct ExplorationData {
   std::vector<Eigen::Vector2d> frontier_averages_, dormant_frontier_averages_;
   std::vector<std::vector<Eigen::Vector2d>> objects_;
   std::vector<Eigen::Vector2d> object_averages_;
-  std::vector<int> object_labels_;
   Eigen::Vector2d next_pos_;
   Eigen::Vector2d next_local_pos_;  // Local target position along path
   std::vector<Eigen::Vector2d> next_best_path_;

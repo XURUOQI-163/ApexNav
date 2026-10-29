@@ -1,6 +1,6 @@
 from llm.prompt.get_llm_answer import SYSTEM_PROMPT, USER1, ASSISTANT1, USER2, ASSISTANT2
 
-def get_similar_answer_prompt():
+def get_context_prompt():
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": USER1},

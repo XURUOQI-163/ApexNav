@@ -311,7 +311,7 @@ def main(cfg: DictConfig, node: HabitatEvalNode, step_delay: float = 0.0,
                   f'episode_id={env.current_episode.episode_id}', flush=True)
 
         # Get LLM answer and fusion threshold for the target object
-        llm_answer, room, node.fusion_threshold = read_answer(
+        room, node.fusion_threshold = read_answer(
             llm_answer_path, llm_response_path, label, llm_client
         )
 
@@ -414,8 +414,8 @@ def main(cfg: DictConfig, node: HabitatEvalNode, step_delay: float = 0.0,
             node.msg_observations = deepcopy(observations)
             node.ros_pub.habitat_publish_ros_topic(node.msg_observations)
             # Detect objects in the current observation
-            observations["rgb"], score_list, object_masks_list, label_list = get_object(
-                label, observations["rgb"], detector_cfg, llm_answer
+            observations["rgb"], score_list, object_masks_list = get_object(
+                label, observations["rgb"], detector_cfg
             )
 
             # Publish habitat observations to ROS
@@ -431,7 +431,6 @@ def main(cfg: DictConfig, node: HabitatEvalNode, step_delay: float = 0.0,
             cld_with_score_msg.header = Header(stamp=observations["ros_stamp"], frame_id="world")
             cld_with_score_msg.point_clouds = obj_point_cloud_list
             cld_with_score_msg.confidence_scores = score_list
-            cld_with_score_msg.label_indices = label_list
             node.cld_with_score_pub.publish(cld_with_score_msg)
 
             # Generate video frame

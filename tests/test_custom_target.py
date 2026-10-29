@@ -35,16 +35,16 @@ class CustomTargetTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             answers = Path(directory)/'answers.txt'
             responses = Path(directory)/'responses.txt'
-            existing = "chair: ['stool', 0.45, 'living room']\n"
+            existing = "chair: [0.45, 'living room']\n"
             answers.write_text(existing)
             with patch.object(answer_reader, 'get_answer', side_effect=AssertionError('LLM called')):
                 result = answer_reader.read_answer(str(answers), str(responses),
                     'yellow chair', SimpleNamespace(llm_client='none'))
-            self.assertEqual(result, ([], 'everywhere', .5))
+            self.assertEqual(result, ('everywhere', .5))
             self.assertEqual(answers.read_text(), existing)
             self.assertFalse(responses.exists())
             self.assertEqual(answer_reader.read_answer(str(answers), str(responses),
-                'chair', SimpleNamespace(llm_client='none')), (['stool'], 'living room', .45))
+                'chair', SimpleNamespace(llm_client='none')), ('living room', .45))
 
     def test_full_description_reaches_detector_and_both_semantic_backends(self):
         import numpy as np
@@ -58,9 +58,8 @@ class CustomTargetTests(unittest.TestCase):
         cfg = SimpleNamespace(yoloe=SimpleNamespace(confidence_threshold=.3,
             iou_threshold=.5, agnostic_nms=True))
         with patch('vlm.utils.get_object_utils.yoloe_detector.predict', return_value=detections) as detect:
-            _, scores, masks, indices = get_object(target, rgb, cfg, [])
+            _, scores, masks = get_object(target, rgb, cfg)
             self.assertEqual(detect.call_args.kwargs['classes'], [target])
-            self.assertEqual(indices, [0])
         for backend in ('clip', 'blip2'):
             with patch(f'vlm.utils.get_{backend}_similarity.{backend}_client.cosine', return_value=.3) as infer:
                 self.assertEqual(get_semantic_similarity(rgb, target, 'everywhere', backend), .3)

@@ -32,13 +32,12 @@ class VisionContractTests(unittest.TestCase):
         second = np.zeros_like(first); second[6:9, 9:13] = 1
         result = ObjectDetections(
             boxes=[[.1, .1, .4, .5], [.4, .4, .8, .9], [.1, .2, .3, .4]],
-            logits=[.91, .72, .81], phrases=['chair', 'couch', 'sofa'],
+            logits=[.91, .72, .81], phrases=['couch', 'couch', 'sofa'],
             masks=[first, second, first])
         cfg = SimpleNamespace(yoloe=SimpleNamespace(confidence_threshold=.3, iou_threshold=.5, agnostic_nms=True))
         with patch.object(module.yoloe_detector, 'predict', return_value=result) as predict:
-            annotated, scores, masks, indices = module.get_object('couch | sofa | couch', rgb, cfg, ['chair', 'chair', 'sofa'])
-        self.assertEqual(predict.call_args.kwargs['classes'], ['couch', 'sofa', 'chair'])
-        self.assertEqual(indices, [1, 0, 0])
+            annotated, scores, masks = module.get_object('couch | sofa | couch', rgb, cfg)
+        self.assertEqual(predict.call_args.kwargs['classes'], ['couch', 'sofa'])
         np.testing.assert_allclose(scores, [.91, .72, .81])
         np.testing.assert_array_equal(masks[0], first)
         np.testing.assert_array_equal(masks[1], second)
@@ -51,8 +50,8 @@ class VisionContractTests(unittest.TestCase):
         from vlm.detector.detections import ObjectDetections
         cfg = SimpleNamespace(yoloe=SimpleNamespace(confidence_threshold=.3, iou_threshold=.5, agnostic_nms=True))
         with patch.object(module.yoloe_detector, 'predict', return_value=ObjectDetections([], [], [], [])):
-            _, scores, masks, indices = module.get_object('chair', np.zeros((12,20,3), dtype=np.uint8), cfg, [])
-        self.assertEqual((scores, masks, indices), ([], [], []))
+            _, scores, masks = module.get_object('chair', np.zeros((12,20,3), dtype=np.uint8), cfg)
+        self.assertEqual((scores, masks), ([], []))
 
     def test_yoloe_client_decodes_lite_masks_at_original_resolution(self):
         module = require_module(self, 'vlm.detector.yoloe')

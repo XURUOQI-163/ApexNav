@@ -38,20 +38,9 @@ class RayCaster2D;
 namespace apexnav_planner {
 class SDFMap2D;
 
-static const char* T_COLORS[] = {
-  "\033[0m",     ///< Default color [0]
-  "\033[1;31m",  ///< Red color [1]
-  "\033[1;32m",  ///< Green color [2]
-  "\033[1;33m",  ///< Yellow color [3]
-  "\033[1;34m",  ///< Blue color [4]
-  "\033[1;35m",  ///< Purple color [5]
-  "\033[1;36m"   ///< Cyan color [6]
-};
-
 struct DetectedObject {
   pcl::shared_ptr<pcl::PointCloud<pcl::PointXYZ>> cloud;  ///< 3D point cloud of detected object
   double score;                                           ///< Confidence score from detector (0-1)
-  int label;                                              ///< Semantic class label from detection
 };
 
 struct Viewpoint2D {
@@ -78,26 +67,13 @@ struct ObjectCluster {
   Vector3d box_min3d_, box_max3d_;       ///< 3D bounding box from point clouds
   int max_seen_count_;                   ///< Maximum observation count across all cells
   vector<Vector2d> good_cells_;          ///< High-confidence cells (frequently observed)
-  int best_label_;                       ///< Most confident semantic label
 
-  /******* 3D Point Cloud Information *******/
-  vector<pcl::shared_ptr<pcl::PointCloud<pcl::PointXYZ>>> clouds_;  ///< Point clouds per semantic
-                                                                    ///< class
-  vector<double> confidence_scores_;    ///< Confidence scores per semantic class
-  vector<int> observation_nums_;        ///< Number of observations per class
-  vector<int> observation_cloud_sums_;  ///< Total point count per class
+  // One evidence history per target instance.
+  pcl::shared_ptr<pcl::PointCloud<pcl::PointXYZ>> cloud_;
+  double confidence_ = 0.0;
+  int observation_count_ = 0;
+  int observed_points_ = 0;
 
-  /**
-   * @brief Constructor to initialize multi-class storage
-   * @param size Number of semantic classes to support (default: 5)
-   */
-  ObjectCluster(int size = 5)
-    : clouds_(size)
-    , confidence_scores_(size, 0.0)
-    , observation_nums_(size, 0)
-    , observation_cloud_sums_(size, 0)
-  {
-  }
 };
 
 class ObjectMap2D {
@@ -116,7 +92,7 @@ public:
       vector<pcl::shared_ptr<pcl::PointCloud<pcl::PointXYZ>>>& top_object_clouds,
       bool limited_confidence = true, bool extreme = false);
   void getObjects(
-      vector<vector<Vector2d>>& clusters, vector<Vector2d>& averages, vector<int>& labels);
+      vector<vector<Vector2d>>& clusters, vector<Vector2d>& averages);
   void getObjectBoxes(vector<pair<Vector2d, Vector2d>>& boxes);
   void getObjectBoxes(vector<pair<Vector3d, Vector3d>>& boxes);
   void getObjectBoxes(vector<Vector3d>& bmin, vector<Vector3d>& bmax);
@@ -133,7 +109,6 @@ public:
 private:
   double fusionConfidenceScore(
       int total_last, double c_last, int n_now, double c_now, int total_now, int sum);
-  void updateObjectBestLabel(int obj_idx);
   Eigen::Vector4d getColor(const double& h, double alpha);
 
   bool haveOverlap(
@@ -153,7 +128,7 @@ private:
   bool isObjectClustered(const int& adr);
   bool isObjectClustered(const Eigen::Vector2d& pos);
   bool isObjectClustered(const Eigen::Vector2i& idx);
-  void printFusionInfo(const ObjectCluster& obj, int label, const char* state);
+  void printFusionInfo(const ObjectCluster& obj, const char* state);
 
   // Wrapper of sdf map
   int toAdr(const Eigen::Vector2d& pos);
@@ -186,15 +161,10 @@ private:
   unique_ptr<RayCaster2D> raycaster_;
 };
 
-inline void ObjectMap2D::printFusionInfo(const ObjectCluster& obj, int label, const char* state)
+inline void ObjectMap2D::printFusionInfo(const ObjectCluster& obj, const char* state)
 {
-  // Use purple for high-confidence label 0, green for others
-  if (label == 0 && obj.confidence_scores_[label] >= min_confidence_)
-    RCLCPP_WARN(node_->get_logger(), "%s%s id = %d label = %d confidence score = %.3lf %s", T_COLORS[5], state, obj.id_,
-        label, obj.confidence_scores_[label], T_COLORS[0]);
-  else
-    RCLCPP_WARN(node_->get_logger(), "%s%s id = %d label = %d confidence score = %.3lf %s", T_COLORS[2], state, obj.id_,
-        label, obj.confidence_scores_[label], T_COLORS[0]);
+  RCLCPP_WARN(node_->get_logger(), "%s target id = %d confidence = %.3lf observations = %d",
+      state, obj.id_, obj.confidence_, obj.observation_count_);
 }
 
 inline bool ObjectMap2D::isSatisfyObject(const Eigen::Vector2i& idx)
@@ -404,11 +374,8 @@ inline void ObjectMap2D::publishObjectClouds()
 
   // Process each detected object
   for (const auto& object : objects_) {
-    if (object.best_label_ == -1)
-      continue;  // Skip objects without valid classification
-
-    // Get the best-confidence point cloud for this object
-    const auto& cloud = object.clouds_[object.best_label_];
+    const auto& cloud = object.cloud_;
+    if (!cloud) continue;
 
     // Color and transform each point
     for (const auto& point : cloud->points) {
@@ -417,8 +384,8 @@ inline void ObjectMap2D::publishObjectClouds()
       colored_point.y = point.y;
       colored_point.z = point.z + 1.0;  // Elevate for better visibility
 
-      // Generate class-specific color with soft blending
-      Eigen::Vector4d col = getColor(object.best_label_ / 5.0, 1.0);
+      // Draw target instances with a common color
+      Eigen::Vector4d col = getColor(0.0, 1.0);
       double blend_factor = 0.5;  // Softening factor for pastel colors
       uint8_t r = col(0) * 255 * blend_factor + 255 * (1.0 - blend_factor);
       uint8_t g = col(1) * 255 * blend_factor + 255 * (1.0 - blend_factor);
