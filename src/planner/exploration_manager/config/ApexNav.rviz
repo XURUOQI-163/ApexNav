@@ -204,6 +204,69 @@ Visualization Manager:
           Value: true
       Enabled: true
       Name: Exploration
+    - Class: rviz_default_plugins/Map
+      Enabled: true
+      Name: Topology rolling local map
+      Alpha: 0.7
+      Color Scheme: map
+      Draw Behind: true
+      Topic:
+        Depth: 1
+        Durability Policy: Transient Local
+        Reliability Policy: Reliable
+        History Policy: Keep Last
+        Value: /topology/local_map
+      Value: true
+    - Class: rviz_default_plugins/Path
+      Enabled: true
+      Name: Topology global route
+      Color: 40; 80; 255
+      Line Style: Lines
+      Line Width: 0.04
+      Topic:
+        Depth: 1
+        Durability Policy: Volatile
+        Reliability Policy: Reliable
+        History Policy: Keep Last
+        Value: /topology/global_path
+      Value: true
+    - Class: rviz_default_plugins/Path
+      Enabled: true
+      Name: Topology local safe path
+      Color: 255; 160; 0
+      Line Style: Lines
+      Line Width: 0.05
+      Topic:
+        Depth: 1
+        Durability Policy: Volatile
+        Reliability Policy: Reliable
+        History Policy: Keep Last
+        Value: /topology/local_path
+      Value: true
+    - Class: rviz_default_plugins/MarkerArray
+      Enabled: true
+      Name: Skeleton Graph
+      Namespaces: {}
+      Queue Size: 1
+      Topic:
+        Depth: 1
+        Durability Policy: Transient Local
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /skeleton_graph/markers
+      Value: true
+    - Class: rviz_default_plugins/MarkerArray
+      Enabled: true
+      Name: Sparse topology
+      Namespaces: {}
+      Queue Size: 10
+      Topic:
+        Depth: 1
+        Durability Policy: Transient Local
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /sparse_topology/markers
+      Value: true
     - Class: rviz_default_plugins/MarkerArray
       Enabled: true
       Name: Frontier boundaries and centers

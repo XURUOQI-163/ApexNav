@@ -725,8 +725,10 @@ void ExplorationFSMReal::habitatStateCallback(const std_msgs::msg::Int32::Shared
 {
   // HABITAT_STATE::EPISODE_FINISH = 3
   if (msg->data == 3) {
-    RCLCPP_INFO(node_->get_logger(), "[Real] Episode finished, reinitializing...");
-    resetEpisode();
+    stop_pub_->publish(std_msgs::msg::Empty());
+    fd_->static_state_ = true;
+    fd_->have_finished_ = true; // Skip FINISH's visualization clearing.
+    transitState(RealFSM::State::FINISH, "Habitat episode ended; retaining map");
   }
 }
 

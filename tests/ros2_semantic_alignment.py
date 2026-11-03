@@ -22,7 +22,8 @@ from sensor_msgs_py import point_cloud2
 from plan_env.msg import SemanticScore, FrontierScan
 from basic_utils.frontier_frame_window import Frame, project_cells
 from visualization_msgs.msg import MarkerArray, Marker
-from habitat2ros.episode_reset import reset_episode
+from habitat2ros.episode_reset import reset_episode, finish_episode
+from std_msgs.msg import Int32
 from tf_transformations import quaternion_from_euler
 
 
@@ -32,6 +33,7 @@ def main():
     os.environ['ROS_DOMAIN_ID'] = '94'
     rclpy.init(domain_id=94)
     node = rclpy.create_node('semantic_alignment_probe')
+    node.state_pub = node.create_publisher(Int32, '/habitat/state', 10)
     depth_pub = node.create_publisher(Image, '/habitat/camera_depth', 10)
     pose_pub = node.create_publisher(Odometry, '/habitat/sensor_pose', 10)
     score_pub = node.create_publisher(SemanticScore, '/semantic/score', 10)
@@ -173,6 +175,13 @@ def generate_launch_description():
                 for _ in range(4):odom_pub.publish(old_odom);spin(.1)
                 if continuous:
                     assert any(m.points for m in paths), 'Fixture did not populate traveled path'
+                finish_episode(node)
+                spin(.6)
+                assert clouds[-1].width > 0 and free_clouds[-1].width > 0, 'Episode exit erased the map'
+                assert any(m.action == Marker.ADD for m in labels[-1].markers), 'Episode exit erased frontier labels'
+                if continuous:
+                    assert paths[-1].points, 'Episode exit erased traveled path'
+                print('PASS: episode finish retains map, frontier semantics, labels and traveled path')
                 reset_episode(node, continuous=continuous)
                 spin(.6)
                 assert clouds[-1].width==0, 'Previous frontier scores survived reset'

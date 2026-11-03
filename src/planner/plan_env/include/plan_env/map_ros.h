@@ -18,6 +18,8 @@
 #include <plan_env/object_map2d.h>
 #include <plan_env/value_map2d.h>
 #include <plan_env/frontier_map2d.h>
+#include <plan_env/sparse_topology_observer.h>
+#include <plan_env/skeleton_graph_manager.h>
 
 // OpenCV for image processing
 #include <cv_bridge/cv_bridge.hpp>
@@ -130,6 +132,8 @@ private:
 
   // Core mapping interface
   SDFMap2D* map_;
+  std::unique_ptr<SparseTopologyObserver> sparse_topology_;
+  std::unique_ptr<SkeletonGraphManager> skeleton_graph_;
 
   // Message synchronization types
   using SyncPolicyImagePose = message_filters::sync_policies::ExactTime<

@@ -22,6 +22,7 @@
   <depend>vis_utils</depend>
   <depend>lkh_mtsp_solver</depend>
   <depend>trajectory_manager</depend>
+  <exec_depend>topology_exploration</exec_depend>
   <depend>cv_bridge</depend>
   <depend>tf2</depend>
   <depend>tf2_ros</depend>

@@ -1,0 +1,12 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>topology_exploration</name><version>0.1.0</version>
+  <description>Geometric sparse topology exploration with rolling local mapping and MPC.</description>
+  <maintainer email="zagerzhang@todo.todo">ApexNav maintainers</maintainer><license>GPLv3</license>
+  <buildtool_depend>ament_cmake</buildtool_depend>
+  <depend>rclcpp</depend><depend>std_msgs</depend><depend>std_srvs</depend>
+  <depend>nav_msgs</depend><depend>geometry_msgs</depend><depend>sensor_msgs</depend>
+  <depend>visualization_msgs</depend><depend>message_filters</depend><depend>cv_bridge</depend>
+  <depend>plan_env</depend><depend>trajectory_manager</depend>
+  <export><build_type>ament_cmake</build_type></export>
+</package>

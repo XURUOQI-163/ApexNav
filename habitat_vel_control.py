@@ -26,7 +26,7 @@ from std_msgs.msg import Empty, Int32, String
 
 from basic_utils.velocity_command import VelocityCommand
 from habitat2ros.habitat_publisher import ROSPublisherNonNode
-from habitat2ros.episode_reset import reset_episode
+from habitat2ros.episode_reset import reset_episode, finish_episode
 from params import HABITAT_STATE
 from vlm.label_utils import resolve_navigation_target
 
@@ -82,7 +82,8 @@ def _run_perception(config, stop_event):
 def run_simulation(cfg, node, perception_process, target_description=None):
     cfg = patch_config(cfg)
     fps = float(cfg.continuous.control_hz)
-    scan_seconds = float(cfg.continuous.initial_scan_seconds)
+    geometric = cfg.get("navigation_planner", "APEXNAV") == "TOPOLOGY"
+    scan_seconds = 0. if geometric else float(cfg.continuous.initial_scan_seconds)
     if not math.isfinite(fps) or fps <= 0:
         raise ValueError('continuous.control_hz must be positive and finite')
     if not math.isfinite(scan_seconds) or scan_seconds < 0:
@@ -106,8 +107,8 @@ def run_simulation(cfg, node, perception_process, target_description=None):
         env.current_episode = env.episodes[episode_index]
         observations = env.reset()
         episode = env.current_episode
-        label = resolve_navigation_target(episode.object_category, cfg.habitat.dataset.data_path,
-                                          target_description)
+        label = "geometric exploration" if geometric else resolve_navigation_target(
+            episode.object_category, cfg.habitat.dataset.data_path, target_description)
         print(f'Continuous mode: index={episode_index}, episode_id={episode.episode_id}, '
               f'scene={episode.scene_id}, target={label}', flush=True)
 
@@ -124,7 +125,7 @@ def run_simulation(cfg, node, perception_process, target_description=None):
         while rclpy.ok() and not env.episode_over:
             loop_start = time.monotonic()
             rclpy.spin_once(node, timeout_sec=0.)
-            if not perception_process.is_alive():
+            if perception_process is not None and not perception_process.is_alive():
                 raise RuntimeError(f'Visual processing node exited ({perception_process.exitcode}); see its traceback')
             if node.stop_requested:
                 env.step(HabitatSimActions.stop)
@@ -154,10 +155,10 @@ def run_simulation(cfg, node, perception_process, target_description=None):
             observations['linear_velocity'] = actual_speed
             observations['angular_velocity'] = angular
             node.ros_pub.habitat_publish_ros_topic(observations)
-            if loop_start - last_label_time >= .5:
+            if not geometric and loop_start - last_label_time >= .5:
                 node.label_pub.publish(String(data=label))
                 last_label_time = loop_start
-            if elapsed_sim_time >= scan_seconds and loop_start - last_trigger_time >= .5:
+            if not geometric and elapsed_sim_time >= scan_seconds and loop_start - last_trigger_time >= .5:
                 node.trigger_pub.publish(PoseStamped())
                 last_trigger_time = loop_start
             frames += 1
@@ -166,7 +167,9 @@ def run_simulation(cfg, node, perception_process, target_description=None):
                 node.get_logger().info(f'Finding {label}: v={actual_speed:.3f} m/s, w={angular:.3f} rad/s, tick={frames}')
             time.sleep(max(0., time_step - (time.monotonic() - loop_start)))
 
-        if target_description is not None:
+        if geometric:
+            print(f'Geometric exploration ended: ticks={frames}, sim_time={elapsed_sim_time:.2f}s', flush=True)
+        elif target_description is not None:
             print(f'Custom-target simulation ended: target={label}, ticks={frames}, '
                   f'sim_time={elapsed_sim_time:.2f}s', flush=True)
         else:
@@ -178,7 +181,7 @@ def run_simulation(cfg, node, perception_process, target_description=None):
 
 def run_continuous(cfg, target_description=None):
     """Own the simulator ROS node and the automatically managed visual bridge."""
-    # Keep ROS alive through Ctrl+C so finally can request and acknowledge reset.
+    # Keep ROS alive through Ctrl+C so finally can stop motion without clearing the map.
     rclpy.init(signal_handler_options=SignalHandlerOptions.NO)
     signal.signal(signal.SIGINT, signal.default_int_handler)
     signal.signal(signal.SIGTERM, signal.default_int_handler)
@@ -195,12 +198,13 @@ def run_continuous(cfg, target_description=None):
         # Resolve the selected dataset configuration before passing it to the
         # visual bridge, including its matching LLM cache and camera parameters.
         cfg = patch_config(cfg)
-        context = multiprocessing.get_context('spawn')
-        stop_event = context.Event()
-        process = context.Process(
-            target=_run_perception, args=(OmegaConf.to_container(cfg, resolve=True), stop_event),
-            name='apexnav_continuous_perception')
-        process.start()
+        if cfg.get('navigation_planner', 'APEXNAV') != 'TOPOLOGY':
+            context = multiprocessing.get_context('spawn')
+            stop_event = context.Event()
+            process = context.Process(
+                target=_run_perception, args=(OmegaConf.to_container(cfg, resolve=True), stop_event),
+                name='apexnav_continuous_perception')
+            process.start()
         run_simulation(cfg, node, process, target_description=target_description)
     except KeyboardInterrupt:
         print('Continuous simulation interrupted.', flush=True)
@@ -220,13 +224,10 @@ def run_continuous(cfg, target_description=None):
                 process.kill()
                 process.join(timeout=2.)
         if node is not None:
-            # Stop the producer before clearing caches: an in-flight inference
-            # must not publish into the next episode's planner state.
+            # Keep planner/map/topology available for inspection. The next
+            # simulation's entry handshake clears all previous episode state.
             if rclpy.ok():
-                try:
-                    reset_episode(node, continuous=True, timeout=3.)
-                except Exception as exc:
-                    node.get_logger().warning(f'Exit reset incomplete: {exc}; next startup will retry')
+                finish_episode(node)
             node.destroy_node()
         if rclpy.ok():
             rclpy.shutdown()

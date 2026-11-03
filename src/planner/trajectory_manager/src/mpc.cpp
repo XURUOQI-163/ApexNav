@@ -43,10 +43,20 @@ void MPC::init(rclcpp::Node::SharedPtr node)
   R = node_->get_parameter("mpc.matrix_r").as_double_array();
   Rd = node_->get_parameter("mpc.matrix_rd").as_double_array();
 
+  if (!node_->has_parameter("mpc.strict_command_limits")) node_->declare_parameter("mpc.strict_command_limits",false);
+  strict_limits_=node_->get_parameter("mpc.strict_command_limits").as_bool();
+  if (!node_->has_parameter("mpc.max_accel")) node_->declare_parameter("mpc.max_accel",max_accel);
+  if (!node_->has_parameter("mpc.max_angular_accel")) node_->declare_parameter("mpc.max_angular_accel",max_omega*2/3);
+  if (strict_limits_) max_accel=node_->get_parameter("mpc.max_accel").as_double();
+  if(T<3||T>=499||delay_num<0||delay_num>=T-1||dt<=0||!std::isfinite(dt)||Q.size()!=4||R.size()!=2||Rd.size()!=2||max_iter<=0)
+    throw std::invalid_argument("Invalid MPC dimensions/parameters");
+
   has_odom = false;
   receive_traj_ = false;
   max_comega = max_omega / 3.0 * 2.0 * dt;
   max_cv = max_accel * dt;
+  if(strict_limits_) max_comega=node_->get_parameter("mpc.max_angular_accel").as_double()*dt;
+  if(max_cv<=0||max_comega<=0||max_speed<=0||max_omega<=0)throw std::invalid_argument("Invalid MPC control limits");
   xref = Eigen::Matrix<double, 4, 500>::Zero(4, 500);
   last_output = output = dref = Eigen::Matrix<double, 2, 500>::Zero(2, 500);
   for (int i = 0; i < delay_num; i++) output_buff.push_back(Eigen::Vector2d::Zero());
@@ -67,6 +77,8 @@ void MPC::setOdom(const Eigen::Vector4d& car_state)
 
 Eigen::Vector2d MPC::calCmd(const std::vector<Eigen::Vector3d>& _xref)
 {
+  if(!has_odom || _xref.size()<static_cast<size_t>(T)) { reset(); return Eigen::Vector2d::Zero(); }
+  for(const auto& ref:_xref)if(!ref.allFinite()){reset();return Eigen::Vector2d::Zero();}
   std_msgs::msg::Float64 err;
   err.data = Eigen::Vector2d(now_state.x - _xref[0](0), now_state.y - _xref[0](1)).norm();
   err_pub_->publish(err);
@@ -81,6 +93,7 @@ Eigen::Vector2d MPC::calCmd(const std::vector<Eigen::Vector3d>& _xref)
   getCmd();
   Eigen::Vector2d cmd;
   cmd << output(0, delay_num), output(1, delay_num);
+  if(!solve_ok_||!cmd.allFinite()){reset();return Eigen::Vector2d::Zero();}
   return cmd;
 }
 
@@ -166,6 +179,7 @@ void MPC::predictMotion(MPCState* b)
 
 void MPC::solveMPCV()
 {
+  solve_ok_=false;
   const int dimx = 3 * (T - delay_num);
   const int dimu = 2 * (T - delay_num);
   const int nx = dimx + dimu;
@@ -319,6 +333,15 @@ void MPC::solveMPCV()
     linearMatrix.insert(i + 1, dimx + i + 1) = 1;
   }
 
+  if(strict_limits_) {
+    // The first optimized command is bounded against the actually sent command,
+    // not only against the second horizon command.
+    lowerBound[0]=std::max(min_speed,previous_command_[0]-max_cv);
+    upperBound[0]=std::min(max_speed,previous_command_[0]+max_cv);
+    lowerBound[1]=std::max(-max_omega,previous_command_[1]-max_comega);
+    upperBound[1]=std::min(max_omega,previous_command_[1]+max_comega);
+  }
+
   for (int i = 0; i < nnzA; i++) {
     linearMatrix.insert(irowA[i] + mx, jcolA[i]) = dA[i];
   }
@@ -374,7 +397,10 @@ void MPC::solveMPCV()
     return;
 
   // get the controller input
+  if(solver.getStatus()!=OsqpEigen::Status::Solved)return;
   QPSolution = solver.getSolution();
+  if(QPSolution.size()!=nx||!QPSolution.allFinite())return;
+  solve_ok_=true;
   // RCLCPP_INFO(node_->get_logger(), "Solution: v0=%f     omega0=%f", QPSolution[dimx], QPSolution[dimx+1]);
   for (int i = 0; i < delay_num; i++) {
     output(0, i) = output_buff[i][0];
@@ -394,6 +420,7 @@ void MPC::getCmd()
     predictMotion();
     last_output = output;
     solveMPCV();
+    if(!solve_ok_){output.setZero();break;}
     double du = 0;
     for (int i = 0; i < output.cols(); i++) {
       du = du + fabs(output(0, i) - last_output(0, i)) + fabs(output(1, i) - last_output(1, i));
@@ -418,4 +445,9 @@ void MPC::getCmd()
     output_buff.erase(output_buff.begin());
     output_buff.push_back(Eigen::Vector2d(output(0, delay_num), output(1, delay_num)));
   }
+}
+
+void MPC::reset(){
+  output.setZero();last_output.setZero();previous_command_.setZero();solve_ok_=false;
+  for(auto& c:output_buff)c.setZero();
 }

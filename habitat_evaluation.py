@@ -70,7 +70,7 @@ from basic_utils.object_point_cloud_utils.object_point_cloud import (
 from basic_utils.record_episode.read_record import read_record
 from basic_utils.record_episode.write_record import write_record
 from habitat2ros.habitat_publisher import ROSPublisherNonNode
-from habitat2ros.episode_reset import reset_episode
+from habitat2ros.episode_reset import reset_episode, finish_episode
 from llm.answer_reader.answer_reader import read_answer
 from params import HABITAT_STATE, ROS_STATE, ACTION, RESULT_TYPES
 from vlm.label_utils import resolve_navigation_target
@@ -284,6 +284,13 @@ def main(cfg: DictConfig, node: HabitatEvalNode, step_delay: float = 0.0,
         env_count -= 1
 
     for epi in range(number_of_episodes - num_total):
+        if epi > 0:
+            # The first episode was reset by run_cli; later episodes reset here,
+            # never at the previous episode's exit boundary.
+            reset_episode(node)
+            node.ros_state = ROS_STATE.INIT
+            node.final_state = 0
+            node.expl_result = 0
         # Publish progress information
         node.publish_int32_array(node.progress_pub, [num_total, number_of_episodes])
 
@@ -460,8 +467,7 @@ def main(cfg: DictConfig, node: HabitatEvalNode, step_delay: float = 0.0,
         # Notify ROS system that current episode evaluation is complete
         node.stop_observation_timer()
         node.msg_observations = None
-        node.semantic_bridge.set_target(label,room,force=True)
-        reset_episode(node)
+        finish_episode(node)
 
         if custom_target:
             if need_video:
@@ -605,7 +611,7 @@ def run_cli(argv=None):
     with initialize(version_base=None, config_path="config"):
         cfg = compose(config_name=f"habitat_eval_{args.dataset}",
                       overrides=config_overrides(args.mode, overrides) +
-                      [f"+semantic_model={args.semantic_model}"])
+                      [f"+semantic_model={args.semantic_model}", f"+navigation_planner={args.planner}"])
 
     if args.mode == 'continuous':
         from habitat_vel_control import run_continuous
@@ -628,10 +634,7 @@ def run_cli(argv=None):
         node.msg_observations = None
         node.semantic_bridge.close()
         if rclpy.ok():
-            try:
-                reset_episode(node, timeout=3.)
-            except Exception as exc:
-                node.get_logger().warning(f'Exit reset incomplete: {exc}; next startup will retry')
+            finish_episode(node)
         node.destroy_node()
         if rclpy.ok():
             rclpy.shutdown()

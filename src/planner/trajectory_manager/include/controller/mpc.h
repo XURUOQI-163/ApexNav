@@ -36,8 +36,13 @@ class MPC {
 public:
   Eigen::Vector2d calCmd(const std::vector<Eigen::Vector3d>& _xref);
   void setOdom(const Eigen::Vector4d& car_state);
+  void setPreviousCommand(const Eigen::Vector2d& command) { previous_command_ = command; }
+  bool healthy() const { return solve_ok_; }
+  void reset();
 
 private:
+  bool strict_limits_ = false, solve_ok_ = false;
+  Eigen::Vector2d previous_command_ = Eigen::Vector2d::Zero();
   // parameters
   /// algorithm param
   double du_th = 0.1;
@@ -101,6 +106,14 @@ private:
 
   void smooth_yaw(void)
   {
+    if (strict_limits_) {
+      double previous = now_state.yaw;
+      for (int i=0;i<T;++i) {
+        xref(3,i) = previous + std::remainder(xref(3,i)-previous, 2*M_PI);
+        previous = xref(3,i);
+      }
+      return;
+    }
     double dyaw = xref(3, 0) - now_state.yaw;
 
     while (dyaw >= M_PI / 2) {

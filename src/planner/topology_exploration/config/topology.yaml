@@ -1,0 +1,30 @@
+/**:
+  ros__parameters:
+    snapshot.interval: 1.0
+    local_map.size: 6.0
+    local_map.resolution: 0.05
+    robot.length: 0.322
+    robot.width: 0.220
+    robot.margin: 0.05
+    collision.min_height: 0.05
+    collision.max_height: 1.25
+    # Candidate selection only; all footprints and edges still require known free cells.
+    sparse_topology.sector_degrees: 30.0
+    sparse_topology.max_distance: 5.0
+    sparse_topology.open_distance: 1.2
+    sparse_topology.jump_distance: 1.0
+    sparse_topology.fine_candidates: true
+    sparse_topology.min_open_angle_degrees: 10.0
+    sparse_topology.candidate_step: 2.2
+    sparse_topology.min_candidate_distance: 0.8
+    max_correction_vel: 0.4
+    max_correction_omega: 1.0
+    mpc.max_accel: 0.5
+    mpc.max_angular_accel: 1.0
+    mpc.strict_command_limits: true
+    mpc.dt: 0.05
+    mpc.predict_steps: 20
+    mpc.delay_num: 0
+    mpc.max_iter: 4
+    safety.depth_timeout: 1.0
+    safety.odom_timeout: 0.5

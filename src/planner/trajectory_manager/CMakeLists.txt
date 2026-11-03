@@ -41,10 +41,18 @@ include_directories(
   ${OMPL_INCLUDE_DIRS}
 )
 
+add_library(mpc_controller SHARED src/mpc.cpp)
+ament_target_dependencies(mpc_controller rclcpp nav_msgs geometry_msgs visualization_msgs sensor_msgs std_msgs)
+target_link_libraries(mpc_controller OsqpEigen::OsqpEigen)
+target_include_directories(mpc_controller PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include> $<INSTALL_INTERFACE:include>)
+install(TARGETS mpc_controller EXPORT mpc_controllerExport LIBRARY DESTINATION lib ARCHIVE DESTINATION lib)
+ament_export_targets(mpc_controllerExport HAS_LIBRARY_TARGET)
+ament_export_libraries(mpc_controller)
+ament_export_dependencies(OsqpEigen Eigen3)
+
 # traj_server 실행 파일 생성
 add_executable(traj_server
   src/traj_server.cpp
-  src/mpc.cpp
 )
 
 target_include_directories(traj_server PUBLIC
@@ -62,6 +70,7 @@ ament_target_dependencies(traj_server
 )
 
 target_link_libraries(traj_server
+  mpc_controller
   OsqpEigen::OsqpEigen
 )
 

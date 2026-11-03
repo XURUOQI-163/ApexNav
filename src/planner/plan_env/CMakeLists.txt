@@ -33,7 +33,11 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/MultipleMasksWithConfidence.msg"
   "msg/SemanticScore.msg"
   "msg/FrontierScan.msg"
-  DEPENDENCIES std_msgs sensor_msgs geometry_msgs
+  "msg/SkeletonNode.msg"
+  "msg/SkeletonEdge.msg"
+  "msg/SkeletonGraph.msg"
+  "msg/SkeletonFrontierLink.msg"
+  DEPENDENCIES std_msgs sensor_msgs geometry_msgs nav_msgs
 )
 
 # Include 디렉토리 설정
@@ -55,7 +59,18 @@ add_library(plan_env_lib SHARED
   src/frontier_map2d.cpp
   src/object_map2d.cpp
   src/value_map2d.cpp
+  src/topology_graph.cpp
+  src/sparse_topology_observer.cpp
+  src/skeleton_graph.cpp
+  src/skeleton_frontier_links.cpp
+  src/skeleton_graph_manager.cpp
 )
+
+# Use the already-installed contrib module when available; otherwise the core
+# includes a small Zhang-Suen implementation with no new package requirement.
+if(TARGET opencv_ximgproc)
+  target_compile_definitions(plan_env_lib PRIVATE APEXNAV_HAVE_XIMGPROC)
+endif()
 
 target_include_directories(plan_env_lib PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
@@ -117,10 +132,28 @@ ament_export_dependencies(
 
 if(BUILD_TESTING)
   enable_testing()
+  add_executable(sparse_topology_test ../../../tests/sparse_topology_test.cpp src/topology_graph.cpp)
+  add_test(NAME sparse_topology COMMAND sparse_topology_test)
   add_executable(target_object_fusion_test ../../../tests/target_object_fusion.cpp)
   target_link_libraries(target_object_fusion_test plan_env_lib)
   add_test(NAME target_object_fusion COMMAND target_object_fusion_test)
   set_tests_properties(target_object_fusion PROPERTIES ENVIRONMENT "ROS_DOMAIN_ID=94" TIMEOUT 30)
+  add_executable(skeleton_graph_test tests/skeleton_graph_test.cpp src/skeleton_graph.cpp)
+  target_link_libraries(skeleton_graph_test ${OpenCV_LIBRARIES})
+  if(TARGET opencv_ximgproc)
+    target_compile_definitions(skeleton_graph_test PRIVATE APEXNAV_HAVE_XIMGPROC)
+  endif()
+  add_test(NAME skeleton_graph COMMAND skeleton_graph_test)
+  add_executable(skeleton_graph_fallback_test tests/skeleton_graph_test.cpp src/skeleton_graph.cpp)
+  target_link_libraries(skeleton_graph_fallback_test ${OpenCV_LIBRARIES})
+  add_test(NAME skeleton_graph_fallback COMMAND skeleton_graph_fallback_test)
+  add_executable(skeleton_frontier_links_test tests/skeleton_frontier_links_test.cpp src/skeleton_graph.cpp src/skeleton_frontier_links.cpp)
+  target_link_libraries(skeleton_frontier_links_test ${OpenCV_LIBRARIES})
+  add_test(NAME skeleton_frontier_links COMMAND skeleton_frontier_links_test)
+  add_executable(skeleton_manager_test tests/skeleton_manager_test.cpp)
+  target_link_libraries(skeleton_manager_test plan_env_lib)
+  add_test(NAME skeleton_manager COMMAND skeleton_manager_test)
+  set_tests_properties(skeleton_manager PROPERTIES ENVIRONMENT "ROS_DOMAIN_ID=94" TIMEOUT 30)
 endif()
 
 ament_package()

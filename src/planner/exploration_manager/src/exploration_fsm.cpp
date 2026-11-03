@@ -617,8 +617,12 @@ void ExplorationFSM::habitatStateCallback(const std_msgs::msg::Int32::SharedPtr 
 {
   if (msg->data == HABITAT_STATE::ACTION_FINISH && state_ == ROS_STATE::WAIT_ACTION_FINISH)
     transitState(PLAN_ACTION, "Habitat Finish Action");
-  if (msg->data == HABITAT_STATE::EPISODE_FINISH)
-    resetEpisode();
+  if (msg->data == HABITAT_STATE::EPISODE_FINISH) {
+    // Inspection boundary: stop planning without clearing map or markers.
+    // The next simulation invokes /exploration/reset before publishing data.
+    fd_->have_finished_ = true;
+    transitState(ROS_STATE::FINISH, "Habitat episode ended; retaining map");
+  }
   return;
 }
 

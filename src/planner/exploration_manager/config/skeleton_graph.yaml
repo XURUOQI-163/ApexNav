@@ -1,0 +1,21 @@
+/**:
+  ros__parameters:
+    skeleton_graph:
+      enabled: false                 # Enable with simulation.launch.py skeleton:=true
+      update_hz: 1.0                 # Maximum snapshot polling/rebuild submission rate
+      change_tile_size: 32           # Pixels per fingerprint tile, NOT a second map
+      min_changed_tiles: 1           # Rebuild after this many changed tiles
+      min_changed_ratio: 0.0         # Optional OR ratio of all tiles; 0 disables ratio test
+      min_branch_length: 0.30        # Metres; 0 disables leaf-to-junction pruning
+      unknown_boundary_distance: 0.50 # Metres to nearest unknown pixel centre
+      protect_unknown_endpoints: true
+      remove_deadends: true          # Remove formal one-neighbor Endpoint and its branch
+      connect_frontiers: true        # Current active/dormant Frontier -> nearest reachable Junction
+      junction_merge_distance: 1.0   # Metres, strict <; 0 disables. Pair midpoint / group member mean.
+      node_match_distance: 0.40      # Metres; same node type, nearest one-to-one match
+      visualization_z: 0.12
+      frontier_visualization_z: 0.36 # Match existing Frontier sphere/cube centres
+      node_scale: 0.16
+      edge_width: 0.035
+      label_scale: 0.14
+      show_node_ids: true

@@ -2,6 +2,7 @@
 data
 
 outputs
+topology_snapshot/
 videos
 
 __pycache__/

@@ -1,3 +1,4 @@
+#include <plan_env/depth_projection.h>
 /**
  * @file map_ros.cpp
  * @brief Implementation of ROS2 interface for 2D SDF mapping system
@@ -181,6 +182,16 @@ void MapROS::init()
       frontier_color_min_ >= frontier_color_max_)
     throw std::invalid_argument("frontier_visualization requires finite score_min < score_max");
 
+  if (!node_->has_parameter("sparse_topology.enabled"))
+    node_->declare_parameter("sparse_topology.enabled", false);
+  if (node_->get_parameter("sparse_topology.enabled").as_bool())
+    sparse_topology_ = std::make_unique<SparseTopologyObserver>(node_, map_);
+
+  if (!node_->has_parameter("skeleton_graph.enabled"))
+    node_->declare_parameter("skeleton_graph.enabled", false);
+  if (node_->get_parameter("skeleton_graph.enabled").as_bool())
+    skeleton_graph_ = std::make_unique<SkeletonGraphManager>(node_, map_, frame_id_);
+
   // Setup subscribers for object detection and CLIP scores
   detected_object_cloud_sub_ = node_->create_subscription<plan_env::msg::MultipleMasksWithConfidence>(
       "/yoloe/clouds_with_scores", 10,
@@ -220,6 +231,7 @@ void MapROS::init()
 
 void MapROS::clearVisualization()
 {
+  if (sparse_topology_) sparse_topology_->publish();
   // Publish on every idle visualization tick as well, so subscribers discovering
   // the reconstructed map publishers late still receive the empty scene.
   PointCloud3D::Ptr empty(new PointCloud3D());
@@ -244,6 +256,7 @@ void MapROS::visCallback()
     clearVisualization();
     return;
   }
+  if (sparse_topology_) sparse_topology_->publish();
   // Publish all visualization topics
   publishOccupied();
   publishInfOccupied();
@@ -528,6 +541,8 @@ void MapROS::depthPoseCallback(
     return;
   last_depth_stamp_ = stamp;
 
+  if (sparse_topology_) sparse_topology_->begin(img, pose, fx_, fy_, cx_, cy_);
+
   // Convert depth image format (Habitat publishes Float32, some sensors use 8UC1)
   cv_bridge::CvImagePtr cv_ptr = cv_bridge::toCvCopy(img, img->encoding);
   if (img->encoding == sensor_msgs::image_encodings::TYPE_32FC1)
@@ -553,6 +568,7 @@ void MapROS::depthPoseCallback(
   // Frontier geometry and visibility must belong to this image's timestamp.
   // Updating only in a later planning tick would attach old scores to new nodes.
   map_->frontier_map2d_->searchFrontiers();
+  if (sparse_topology_) sparse_topology_->finish();
   double process_time = (node_->get_clock()->now() - t1).seconds();
   RCLCPP_INFO_THROTTLE(node_->get_logger(), *node_->get_clock(), 50000,
       "[Calculating Time] Grid Map process time = %.3f s", process_time);
@@ -632,7 +648,8 @@ void MapROS::processDepthImage()
       pt_cur(2) = depth;
 
       // Transform to world coordinates
-      pt_world = camera_r * pt_cur + camera_pos_;
+      pt_world = projectDepthPixel(u, v, depth, fx_, fy_, cx_, cy_, camera_r, camera_pos_);
+      if (sparse_topology_) sparse_topology_->sample(u, v, pt_world);
       auto& pt = depth_cloud_->points[proj_points_cnt_++];
       pt.x = pt_world[0];
       pt.y = pt_world[1];

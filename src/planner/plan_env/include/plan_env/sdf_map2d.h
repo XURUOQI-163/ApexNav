@@ -36,17 +36,18 @@ class ObjectMap2D;
 class ValueMap;
 class FrontierMap2D;
 class MapROS;
+namespace topology { class RollingLocalMap; }
 
 class SDFMap2D {
 public:
-  SDFMap2D() = default;
+  SDFMap2D();
   ~SDFMap2D();  // Explicit destructor declaration for unique_ptr with forward declaration
 
   /// Grid occupancy states
   enum GRID_STATE { UNKNOWN, FREE, OCCUPIED };
 
   // Core map management functions
-  void initMap(rclcpp::Node::SharedPtr node);
+  void initMap(rclcpp::Node::SharedPtr node, bool with_interfaces = true);
   void inputDepthCloud2D(const pcl::PointCloud<pcl::PointXY>::Ptr& points,
       const Eigen::Vector3d& camera_pos, vector<Eigen::Vector2i>& free_grids);
   void inputObjectCloud2D(
@@ -103,6 +104,7 @@ private:
   unique_ptr<MapROS> map_ros_;      ///< ROS interface and visualization
   unique_ptr<RayCaster2D> caster_;  ///< Raycasting utility for occupancy updates
 
+  friend topology::RollingLocalMap;
   friend MapROS;  ///< Allow MapROS to access private members
 
 public:
@@ -217,7 +219,7 @@ inline bool SDFMap2D::isInMap(const Eigen::Vector2i& idx)
   return true;
 }
 
-/// Get occupancy state at grid index (UNKNOWN=-1, FREE=0, OCCUPIED=1)
+/// Get GRID_STATE at grid index (UNKNOWN=0, FREE=1, OCCUPIED=2); -1 outside map.
 inline int SDFMap2D::getOccupancy(const Eigen::Vector2i& id)
 {
   if (!isInMap(id))

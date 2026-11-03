@@ -2,7 +2,24 @@
 import time
 
 import rclpy
+from rclpy.duration import Duration
+from std_msgs.msg import Empty, Int32
 from std_srvs.srv import Trigger
+from params import HABITAT_STATE
+
+
+def finish_episode(node):
+    """Stop planning/control while retaining the final map for inspection."""
+    node.state_pub.publish(Int32(data=HABITAT_STATE.EPISODE_FINISH))
+    publishers = [node.state_pub]
+    if hasattr(node, 'stop_pub'):
+        node.stop_pub.publish(Empty())
+        publishers.append(node.stop_pub)
+    # No reset on exit. Let reliable finish/stop messages reach the planner
+    # before destroying the simulator's publishers.
+    for publisher in publishers:
+        if not publisher.wait_for_all_acked(timeout=Duration(seconds=1.)):
+            node.get_logger().warning('Episode stop acknowledgement timed out')
 
 
 def reset_episode(node, *, continuous=False, timeout=10.0):

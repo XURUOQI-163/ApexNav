@@ -19,13 +19,14 @@
 #include <unordered_map>
 
 namespace apexnav_planner {
+SDFMap2D::SDFMap2D() = default;
 SDFMap2D::~SDFMap2D() = default;
 
-void SDFMap2D::initMap(rclcpp::Node::SharedPtr node)
+void SDFMap2D::initMap(rclcpp::Node::SharedPtr node, bool with_interfaces)
 {
   mp_.reset(new MapParam2D);
   md_.reset(new MapData2D);
-  map_ros_.reset(new MapROS);
+  if (with_interfaces) map_ros_.reset(new MapROS);
 
   // Load map properties from ROS2 parameters
   double x_size, y_size;
@@ -161,12 +162,14 @@ void SDFMap2D::initMap(rclcpp::Node::SharedPtr node)
   md_->update_mind_ = md_->update_maxd_ = Eigen::Vector2d(0, 0);
 
   // Initialize ROS2 components and raycaster
+  if (with_interfaces) {
   object_map2d_.reset(new ObjectMap2D(this, node));
   value_map_.reset(new ValueMap(this, node));
   frontier_map2d_.reset(new FrontierMap2D(this, node));
   map_ros_->setMap(this);
   map_ros_->setNode(node);
   map_ros_->init();
+  }
 
   caster_.reset(new RayCaster2D);
   caster_->setParams(mp_->resolution_, mp_->map_origin_);
@@ -384,7 +387,7 @@ void SDFMap2D::inputDepthCloud2D(const pcl::PointCloud<pcl::PointXY>::Ptr& point
   posToIndex(md_->update_maxd_, md_->update_max_);
   boundIndex(md_->update_min_);
   boundIndex(md_->update_max_);
-  map_ros_->local_updated_ = true;
+  if (map_ros_) map_ros_->local_updated_ = true;
 
   // Process all cached voxels and update their occupancy probabilities
   while (!md_->cache_voxel_.empty()) {
