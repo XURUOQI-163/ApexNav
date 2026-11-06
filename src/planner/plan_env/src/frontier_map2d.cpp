@@ -14,6 +14,8 @@
 #include <plan_env/value_map2d.h>
 #include <plan_env/frontier_ids.h>
 #include <unordered_map>
+#include <set>
+#include <cmath>
 
 namespace apexnav_planner {
 FrontierMap2D::FrontierMap2D(SDFMap2D* sdf_map, rclcpp::Node::SharedPtr node)
@@ -152,7 +154,55 @@ void FrontierMap2D::searchFrontiers()
     frontier.id_ = ids[candidate++];
     frontiers_.push_back(frontier);
   }
+  mergeAdjacentFrontiers();
   syncSemanticFrontiers();
+}
+
+void FrontierMap2D::mergeAdjacentFrontiers()
+{
+  struct Entry { const Frontier2D* frontier; bool active; };
+  std::vector<Entry> entries;
+  std::vector<std::vector<std::pair<int,int>>> cells;
+  auto collect=[&](const list<Frontier2D>& clusters,bool active) {
+    for(const auto& f:clusters) {
+      entries.push_back({&f,active});cells.emplace_back();
+      for(const auto& p:f.cells_) {
+        Vector2i idx;sdf_map_->posToIndex(p,idx);
+        cells.back().emplace_back(idx.x(),idx.y());
+      }
+    }
+  };
+  collect(frontiers_,true);collect(dormant_frontiers_,false);
+  if(entries.size()<2)return;
+  const auto groups=adjacentFrontierGroups(cells);
+  if(groups.size()==entries.size())return;
+
+  list<Frontier2D> active,dormant;
+  for(const auto& group:groups) {
+    Frontier2D merged=*entries[group.front()].frontier;
+    bool is_active=false;
+    if(group.size()>1) {
+      merged.cells_.clear();std::set<int> seen;
+      for(int i:group) {
+        const auto& f=*entries[i].frontier;
+        merged.id_=std::min(merged.id_,f.id_); // Retain oldest ID; retired IDs are never reused.
+        for(const auto& p:f.cells_) {
+          Vector2i idx;sdf_map_->posToIndex(p,idx);
+          if(seen.insert(toAdr(idx)).second)merged.cells_.push_back(p);
+        }
+      }
+      computeFrontierInfo(merged);
+    }
+    for(int i:group)is_active|=entries[i].active;
+    for(const auto& p:merged.cells_) {
+      Vector2i idx;sdf_map_->posToIndex(p,idx);
+      frontier_flag_[toAdr(idx)]=is_active?ACTIVE:DORMANT;
+    }
+    (is_active?active:dormant).push_back(std::move(merged));
+  }
+  frontiers_.swap(active);dormant_frontiers_.swap(dormant);
+  frontier_changed_=true;
+  // Sync once after all merges so unchanged cell tokens/evidence are retained.
 }
 
 void FrontierMap2D::syncSemanticFrontiers()
@@ -257,7 +307,10 @@ void FrontierMap2D::splitLargeFrontiers(list<Frontier2D>& frontiers)
 
 bool FrontierMap2D::splitHorizontally(const Frontier2D& frontier, list<Frontier2D>& splits)
 {
-  auto mean = frontier.average_;  // Spatial centroid for PCA analysis
+  // average_ is now a boundary representative; PCA still needs the true mean.
+  Vector2d mean = Vector2d::Zero();
+  for (const auto& cell : frontier.cells_) mean += cell;
+  mean /= double(frontier.cells_.size());
   bool need_split = false;
 
   // Check if any frontier cells exceed the spatial clustering threshold
@@ -416,8 +469,21 @@ void FrontierMap2D::computeFrontierInfo(Frontier2D& ftr)
     }
   }
 
-  // Compute final centroid as mean position of all cluster cells
-  ftr.average_ /= double(ftr.cells_.size());
+  // Keep the legacy average_ interface, but place its representative on an
+  // actual member cell so RViz, topology links and memory agree on one point.
+  const Vector2d mean = ftr.average_ / double(ftr.cells_.size());
+  ftr.average_ = ftr.cells_.front();
+  double best = (ftr.average_ - mean).squaredNorm();
+  for (const auto& cell : ftr.cells_) {
+    const double distance = (cell - mean).squaredNorm();
+    const bool tie = std::abs(distance - best) <= 1e-12;
+    const bool earlier = cell.x() < ftr.average_.x() ||
+        (cell.x() == ftr.average_.x() && cell.y() < ftr.average_.y());
+    if (distance < best - 1e-12 || (tie && earlier)) {
+      ftr.average_ = cell;
+      best = distance;
+    }
+  }
 }
 
 bool FrontierMap2D::isAnyFrontierChanged()

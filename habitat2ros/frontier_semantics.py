@@ -11,7 +11,7 @@ from rclpy.qos import qos_profile_sensor_data
 from cv_bridge import CvBridge
 from sensor_msgs.msg import Image
 from nav_msgs.msg import Odometry
-from plan_env.msg import FrontierScan, SemanticScore
+from plan_env.msg import FrontierScan, SemanticScore, TopologyObservation
 from basic_utils.frontier_frame_window import Frame, FrameWindow, evaluate_frame
 from vlm.utils.get_semantic_similarity import get_semantic_similarity
 
@@ -41,6 +41,7 @@ class FrontierSemanticBridge:
         self.epoch=0
         self.closed=False
         self.pub=self.node.create_publisher(SemanticScore,'/semantic/score',20)
+        self.memory_pub=self.node.create_publisher(TopologyObservation,'/topology_memory/scored_observation',2)
         self.rgb_sub=message_filters.Subscriber(self.node,Image,'/habitat/camera_rgb',qos_profile=qos_profile_sensor_data)
         self.scan_sub=message_filters.Subscriber(self.node,FrontierScan,'/frontier_semantics/scan',qos_profile=20)
         self.odom_sub=message_filters.Subscriber(self.node,Odometry,'/habitat/odom',qos_profile=20)
@@ -126,6 +127,8 @@ class FrontierSemanticBridge:
                         lambda image:self.inference(image,*target,self.backend))
                     if result is None:continue
                     score,projected=result
+                    if not was_cached:
+                        frame.memory_computed_at_ns=self.node.get_clock().now().nanoseconds
                     with self.condition:
                         if self.closed:return
                         if generation!=self.generation:break
@@ -140,6 +143,27 @@ class FrontierSemanticBridge:
                         msg.weights=[float(w) for i,w in projected]
                         self.pub.publish(msg)
                         frame.sent_ids.update(msg.cell_ids)
+                    # Optional read-only tap. Keep the pinned ORIGINAL frame even
+                    # when slow inference has outlived the live 20-frame window.
+                    # Memory failures must not change inference retry/fusion state.
+                    if self.memory_pub.get_subscription_count():
+                        try:
+                            observation=TopologyObservation()
+                            observation.header=frame.header
+                            observation.image=self.cv.cv2_to_imgmsg(frame.image,encoding='rgb8')
+                            observation.image.header=frame.header
+                            for pose, values in ((observation.camera_pose,frame.camera_pose),
+                                                 (observation.robot_pose,frame.robot_pose)):
+                                pose.position.x,pose.position.y,pose.position.z=values[:3]
+                                pose.orientation.x,pose.orientation.y,pose.orientation.z,pose.orientation.w=values[3:]
+                            observation.camera_yaw=frame.camera_yaw
+                            observation.goal_text=target[0];observation.model_name=self.backend
+                            observation.raw_similarity=score
+                            observation.computed_at_ns=getattr(frame,'memory_computed_at_ns',0)
+                            observation.cell_ids=msg.cell_ids;observation.weights=msg.weights
+                            self.memory_pub.publish(observation)
+                        except Exception as memory_error:
+                            self.node.get_logger().warning(f'UTM observation skipped: {memory_error}')
                     self.node.get_logger().info(
                         f'semantic[{self.backend}] frame={frame.stamp} raw={score:.4f} '
                         f'cells={len(projected)} cached={was_cached}')

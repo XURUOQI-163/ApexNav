@@ -1,5 +1,5 @@
 #pragma once
-// Independent geometry-only graph. Does not depend on Frontier, depth descriptors or ROS.
+// Geometry-only graph; accepts a snapshot of frontier cell indices, no ROS/model dependency.
 #include <opencv2/core.hpp>
 #include <cstdint>
 #include <string>
@@ -14,11 +14,17 @@ struct Geometry {
   cv::Point2d world(cv::Point pixel) const;
   bool operator==(const Geometry& other) const;
 };
-struct GridInput { Geometry geometry; cv::Mat cells; }; // rows=y, columns=x; temporary classification only
+struct GridInput {
+  Geometry geometry;
+  cv::Mat cells; // rows=y, columns=x; temporary classification only
+  std::vector<cv::Point> frontier_cells; // Actual UNKNOWN member cells, not centroids
+};
 struct Options {
   double min_branch_length=.3,unknown_boundary_distance=.5,node_match_distance=.4;
-  double junction_merge_distance=0; // ROS defaults to 2m; 0 exposes raw geometry.
-  bool protect_unknown_endpoints=true;
+  double min_deadend_width=.2; // 0 disables width pruning; diameter after inflation
+  double deadend_width_sample_fraction=.5; // Terminal fraction, measured from Endpoint
+  double frontier_deadend_distance=.2; // Free-space distance to actual frontier boundary; 0 disables
+  double min_island_area=0; // m^2; discard smaller disconnected free regions, always keep largest; 0 disables
   bool remove_deadends=false;
 };
 struct Node {
@@ -26,7 +32,6 @@ struct Node {
   NodeType type=NodeType::ENDPOINT;
   cv::Point pixel;
   cv::Point2d position;
-  std::vector<cv::Point> anchor_pixels; // Original geometric Junction locations.
   std::vector<uint64_t> neighbors;
   uint32_t neighbor_count=0;
   double clearance=0;
@@ -36,7 +41,7 @@ struct Edge {
   uint64_t id=0,start=0,end=0;
   std::vector<cv::Point> pixels;
   std::vector<cv::Point2d> path;
-  std::vector<cv::Point2d> display_path; // Includes abstract node centres; not a motion path.
+  std::vector<cv::Point2d> display_path; // Same actual skeleton polyline as path.
   double length=0,min_clearance=0;
 };
 struct Graph {
@@ -45,7 +50,6 @@ struct Graph {
   std::vector<Edge> edges;
   uint64_t next_node_id=1,next_edge_id=1;
   uint32_t skeleton_pixels=0,pruned_branches=0,removed_deadends=0;
-  uint32_t merged_junctions=0;
 };
 Graph build(const GridInput& input,const Options& options={},const Graph& previous={});
 const char* thinningBackend();

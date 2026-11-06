@@ -1,0 +1,11 @@
+unified_topology_memory:
+  ros__parameters:
+    write_hz: 1.0                  # One bounded background writer, coalesces snapshots
+    frame_window_size: 20         # Original RGB + scan + odom exact timestamps
+    observation_queue_size: 20    # Pinned scored frames may outlive the camera window
+    node_match_distance: 0.50     # Metres; same-type one-to-one persistent ID recovery
+    max_observations_per_node: 8
+    keyframe_angle_degrees: 45.0
+    keyframe_distance: 0.75       # Metres of camera displacement for a new view
+    jpeg_quality: 90
+    model_version: ''            # Optional explicit model/weights identifier; empty -> null

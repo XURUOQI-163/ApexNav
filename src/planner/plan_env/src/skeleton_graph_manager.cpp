@@ -29,18 +29,24 @@ SkeletonGraphManager::SkeletonGraphManager(const rclcpp::Node::SharedPtr& node,S
   options_.min_branch_length=param(node,"min_branch_length",.3);
   options_.unknown_boundary_distance=param(node,"unknown_boundary_distance",.5);
   options_.node_match_distance=param(node,"node_match_distance",.4);
-  options_.junction_merge_distance=param(node,"junction_merge_distance",2.);
-  options_.protect_unknown_endpoints=param(node,"protect_unknown_endpoints",true);
+  options_.min_deadend_width=param(node,"min_deadend_width",.2);
+  options_.deadend_width_sample_fraction=param(node,"deadend_width_sample_fraction",.5);
+  options_.frontier_deadend_distance=param(node,"frontier_deadend_distance",.2);
+  options_.min_island_area=param(node,"min_island_area",1.);
   options_.remove_deadends=param(node,"remove_deadends",true);
   connect_frontiers_=param(node,"connect_frontiers",true);
+  max_association_distance_=param(node,"frontier_max_association_distance",.5);
+  association_dash_length_=param(node,"frontier_association_dash_length",.04);
   z_=param(node,"visualization_z",.12);node_scale_=param(node,"node_scale",.16);
   frontier_z_=param(node,"frontier_visualization_z",.36); // Original MapROS Frontier centre height.
   edge_width_=param(node,"edge_width",.035);label_scale_=param(node,"label_scale",.14);
   labels_=param(node,"show_node_ids",true);
   if(!std::isfinite(hz)||hz<=0||hz>30)throw std::invalid_argument("skeleton_graph.update_hz must be in (0,30]");
-  for(double v:{options_.min_branch_length,options_.unknown_boundary_distance,options_.node_match_distance,options_.junction_merge_distance})
+  for(double v:{options_.min_island_area,options_.min_branch_length,options_.min_deadend_width,options_.frontier_deadend_distance,options_.unknown_boundary_distance,options_.node_match_distance})
     if(!std::isfinite(v)||v<0)throw std::invalid_argument("skeleton graph distances must be finite and nonnegative");
-  for(double v:{node_scale_,edge_width_,label_scale_})
+  if(!std::isfinite(options_.deadend_width_sample_fraction)||options_.deadend_width_sample_fraction<=0||options_.deadend_width_sample_fraction>1)
+    throw std::invalid_argument("skeleton_graph.deadend_width_sample_fraction must be in (0,1]");
+  for(double v:{node_scale_,edge_width_,label_scale_,max_association_distance_,association_dash_length_})
     if(!std::isfinite(v)||v<=0)throw std::invalid_argument("skeleton graph marker scales must be positive");
   if(!std::isfinite(z_)||!std::isfinite(frontier_z_))throw std::invalid_argument("invalid skeleton marker height");
   graph_pub_=node->create_publisher<plan_env::msg::SkeletonGraph>("/skeleton_graph/graph",rclcpp::QoS(1).transient_local());
@@ -50,6 +56,11 @@ SkeletonGraphManager::SkeletonGraphManager(const rclcpp::Node::SharedPtr& node,S
   sampled_at_=node->now();publish(node); // New map episode clears prior latched graph/markers.
   timer_=node->create_wall_timer(std::chrono::duration<double>(1./hz),[this]{tick();});
   RCLCPP_INFO(node->get_logger(),"[Skeleton] enabled: %.2f Hz, %s, read-only SDFMap2D observer",hz,skeleton::thinningBackend());
+  RCLCPP_INFO(node->get_logger(),"[Skeleton] leaf pruning: length < %.2fm OR terminal %.0f%% max width < %.2fm; no Unknown exemption",
+    options_.min_branch_length,100*options_.deadend_width_sample_fraction,options_.min_deadend_width);
+  RCLCPP_INFO(node->get_logger(),"[Skeleton] isolated segments use full-path width; reachable frontier boundary pruning < %.2fm",
+    options_.frontier_deadend_distance);
+  RCLCPP_INFO(node->get_logger(),"[Skeleton] discard isolated free regions smaller than %.2fm^2; retain largest component",options_.min_island_area);
 }
 SkeletonGraphManager::~SkeletonGraphManager() {
   if(timer_)timer_->cancel();
@@ -74,7 +85,7 @@ skeleton::GridInput SkeletonGraphManager::sample() const {
 }
 std::vector<skeleton::Frontier> SkeletonGraphManager::sampleFrontiers() const {
   std::vector<skeleton::Frontier> out;
-  if(!connect_frontiers_||!map_->frontier_map2d_)return out;
+  if((!connect_frontiers_&&options_.frontier_deadend_distance<=0)||!map_->frontier_map2d_)return out;
   auto append=[&](const auto& list,bool active) {
     for(const auto& f:list) {
       skeleton::Frontier copy;copy.id=f.id_;copy.active=active;copy.centroid={f.average_.x(),f.average_.y()};
@@ -96,12 +107,10 @@ bool SkeletonGraphManager::validateLinks(const std::vector<skeleton::Frontier>& 
     return skeleton::BLOCKED;
   };
   for(auto& c:links_)if(c.connected) {
-    auto f=std::find_if(current.begin(),current.end(),[&](const auto& item){return item.id==c.frontier_id;});
-    Eigen::Vector2i target;map_->posToIndex(Eigen::Vector2d(c.centroid.x,c.centroid.y),target);
-    bool terminal=f!=current.end()&&std::find(f->cells.begin(),f->cells.end(),cv::Point(target.x(),target.y()))!=f->cells.end();
     // Validate shortened segments too, not just the old raster path: a newly
     // observed obstacle may fall on the shortcut but outside the raster path.
-    bool safe=skeleton::frontierPathTraversable(graph_.geometry,c.display_path,state,terminal);
+    bool safe=skeleton::frontierPathTraversable(graph_.geometry,c.display_path,state,false)&&
+      skeleton::frontierAssociationClear(graph_.geometry,c.approach,c.centroid,state);
     for(size_t i=0;i<c.pixels.size()&&safe;++i) {
       auto p=c.pixels[i];safe=free(p);
       if(i){auto prev=c.pixels[i-1];if(p.x!=prev.x&&p.y!=prev.y)safe&=free({p.x,prev.y})&&free({prev.x,p.y});}
@@ -119,7 +128,11 @@ void SkeletonGraphManager::tick() {
     }
     if(job_.valid()) {
       if(job_.wait_for(std::chrono::seconds(0))!=std::future_status::ready)return;
-      auto result=job_.get();graph_=std::move(result.graph);build_ms_=result.build_ms;link_ms_=result.link_ms;
+      auto result=job_.get();
+      // Accept the timestamped snapshot, then rebuild below if frontier geometry
+      // changed during the job. Dropping every changed snapshot would starve
+      // publication while the robot is continuously exploring.
+      graph_=std::move(result.graph);build_ms_=result.build_ms;link_ms_=result.link_ms;
       geometry_rebuilt_=result.geometry_rebuilt;
       // Link-only refreshes must not forget accumulated small map changes.
       if(geometry_rebuilt_)gate_->accept(result.fingerprint);
@@ -128,18 +141,23 @@ void SkeletonGraphManager::tick() {
       if(validateLinks(current))accepted_frontiers_=0;
       ++revision_;publish(node);
       size_t connected=0;for(const auto& c:links_)connected+=c.connected;
-      RCLCPP_INFO(node->get_logger(),"[Skeleton] revision=%lu nodes=%zu edges=%zu removed_deadends=%u merged_junctions=%u frontier_links=%zu/%zu geometry_rebuilt=%d sample=%.1fms build=%.1fms links=%.1fms",
-        revision_,graph_.nodes.size(),graph_.edges.size(),graph_.removed_deadends,graph_.merged_junctions,connected,links_.size(),geometry_rebuilt_,sampling_ms_,build_ms_,link_ms_);
+      RCLCPP_INFO(node->get_logger(),"[Skeleton] revision=%lu nodes=%zu edges=%zu removed_deadends=%u frontier_links=%zu/%zu geometry_rebuilt=%d sample=%.1fms build=%.1fms links=%.1fms",
+        revision_,graph_.nodes.size(),graph_.edges.size(),graph_.removed_deadends,connected,links_.size(),geometry_rebuilt_,sampling_ms_,build_ms_,link_ms_);
     }
     auto start=Clock::now();auto in=sample();auto hashes=skeleton::fingerprint(in,tile_size_);
-    bool rebuild=gate_->shouldRebuild(hashes);
     auto signature=skeleton::frontierFingerprint(current);
+    const bool frontier_rebuild=options_.frontier_deadend_distance>0&&
+      (signature!=accepted_frontiers_||link_gate_->shouldRebuild(hashes));
+    const bool connectivity_changed=options_.min_island_area>0&&link_gate_->shouldRebuild(hashes);
+    bool rebuild=gate_->shouldRebuild(hashes)||frontier_rebuild||connectivity_changed;
+    if(options_.frontier_deadend_distance>0)
+      for(const auto& f:current)in.frontier_cells.insert(in.frontier_cells.end(),f.cells.begin(),f.cells.end());
     bool links_changed=connect_frontiers_&&!current.empty()&&link_gate_->shouldRebuild(hashes);
     if(!rebuild&&!links_changed&&signature==accepted_frontiers_)return;
     changed_tiles_=gate_->changedTiles(hashes);sampled_at_=node->now();sampling_ms_=milliseconds(start);
-    job_=std::async(std::launch::async,[in=std::move(in),hashes=std::move(hashes),options=options_,previous=graph_,current=std::move(current),signature,rebuild]() mutable {
+    job_=std::async(std::launch::async,[in=std::move(in),hashes=std::move(hashes),options=options_,previous=graph_,current=std::move(current),signature,rebuild,connect_frontiers=connect_frontiers_,max_association_distance=max_association_distance_]() mutable {
       auto start=Clock::now();auto graph=rebuild?skeleton::build(in,options,previous):std::move(previous);
-      double build_ms=milliseconds(start);start=Clock::now();auto links=skeleton::connectFrontiers(in,graph,current);
+      double build_ms=milliseconds(start);start=Clock::now();auto links=connect_frontiers?skeleton::connectFrontiers(in,graph,current,max_association_distance):std::vector<skeleton::FrontierLink>{};
       return Result{std::move(graph),std::move(hashes),std::move(links),signature,rebuild,build_ms,milliseconds(start)};
     });
   }catch(const std::exception& e) {
@@ -156,7 +174,8 @@ void SkeletonGraphManager::publish(const rclcpp::Node::SharedPtr& node) {
   for(const auto& n:graph_.nodes) {
     plan_env::msg::SkeletonNode out;out.node_id=n.id;out.node_type=uint8_t(n.type);out.pixel_x=n.pixel.x;out.pixel_y=n.pixel.y;
     out.position=point(n.position);out.neighbor_node_ids=n.neighbors;out.neighbor_count=n.neighbor_count;
-    for(auto p:n.anchor_pixels){out.anchor_pixel_x.push_back(p.x);out.anchor_pixel_y.push_back(p.y);}
+    // Keep the existing wire/storage fields: one actual skeleton location.
+    out.anchor_pixel_x.push_back(n.pixel.x);out.anchor_pixel_y.push_back(n.pixel.y);
     out.clearance=n.clearance;out.near_unknown_boundary=n.near_unknown_boundary;out.active=n.active;msg.nodes.push_back(std::move(out));
   }
   for(const auto& e:graph_.edges) {
@@ -167,7 +186,6 @@ void SkeletonGraphManager::publish(const rclcpp::Node::SharedPtr& node) {
     msg.edges.push_back(std::move(out));
   }
   msg.removed_deadends=graph_.removed_deadends;msg.geometry_rebuilt=geometry_rebuilt_;msg.frontier_link_ms=link_ms_;
-  msg.merged_junctions=graph_.merged_junctions;
   for(const auto& c:links_) {
     plan_env::msg::SkeletonFrontierLink out;out.frontier_id=c.frontier_id;out.active=c.active;out.connected=c.connected;
     out.junction_node_id=c.junction_id;out.frontier_centroid=point(c.centroid);out.approach=point(c.approach);
@@ -204,11 +222,20 @@ void SkeletonGraphManager::publish(const rclcpp::Node::SharedPtr& node) {
   }
   markers.markers.push_back(std::move(endpoints));markers.markers.push_back(std::move(junctions));markers.markers.push_back(std::move(loops));
   auto connections=marker("frontier_links",Marker::LINE_LIST,0,.75,1);connections.scale.x=edge_width_;
+  auto associations=marker("frontier_associations",Marker::LINE_LIST,1,.55,0);associations.scale.x=edge_width_;
   int frontier_label=0;
   for(const auto& c:links_)if(c.connected) {
     for(size_t i=1;i<c.display_path.size();++i) {
       connections.points.push_back(point(c.display_path[i-1],z_));
-      connections.points.push_back(point(c.display_path[i],i+1==c.display_path.size()?frontier_z_:z_));
+      connections.points.push_back(point(c.display_path[i],z_));
+    }
+    // Orange dashes reach the unchanged sphere; they are not traversability edges.
+    if(cv::norm(c.approach-c.centroid)>1e-9) {
+      double length=std::hypot(cv::norm(c.centroid-c.approach),frontier_z_-z_);
+      for(double d=0;d<length;d+=2*association_dash_length_) {
+        for(double t:{d/length,std::min(d+association_dash_length_,length)/length})
+          associations.points.push_back(point(c.approach+(c.centroid-c.approach)*t,z_+(frontier_z_-z_)*t));
+      }
     }
     if(labels_) {
       auto text=marker("frontier_ids",Marker::TEXT_VIEW_FACING,0,.5,.7);text.id=frontier_label++;
@@ -217,6 +244,7 @@ void SkeletonGraphManager::publish(const rclcpp::Node::SharedPtr& node) {
     }
   }
   markers.markers.push_back(std::move(connections));
+  markers.markers.push_back(std::move(associations));
   markers_pub_->publish(markers);
 }
 }

@@ -38,6 +38,7 @@ private:
   std::vector<skeleton::FrontierLink> links_;
   uint64_t accepted_frontiers_=0;
   bool connect_frontiers_=true,geometry_rebuilt_=false;
+  double max_association_distance_=.5,association_dash_length_=.04;
   double link_ms_=0;
   std::future<Result> job_;
   rclcpp::TimerBase::SharedPtr timer_;

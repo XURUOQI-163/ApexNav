@@ -29,6 +29,7 @@ from habitat2ros.habitat_publisher import ROSPublisherNonNode
 from habitat2ros.episode_reset import reset_episode, finish_episode
 from params import HABITAT_STATE
 from vlm.label_utils import resolve_navigation_target
+from habitat2ros.topology_context import publish_topology_context
 
 
 class HabitatVelControlNode(Node):
@@ -109,6 +110,7 @@ def run_simulation(cfg, node, perception_process, target_description=None):
         episode = env.current_episode
         label = "geometric exploration" if geometric else resolve_navigation_target(
             episode.object_category, cfg.habitat.dataset.data_path, target_description)
+        publish_topology_context(node, episode, label, cfg.get('semantic_model', 'clip'))
         print(f'Continuous mode: index={episode_index}, episode_id={episode.episode_id}, '
               f'scene={episode.scene_id}, target={label}', flush=True)
 

@@ -6,6 +6,7 @@
 #include <limits>
 #include <map>
 #include <queue>
+#include <set>
 #include <tuple>
 #include <stdexcept>
 namespace apexnav_planner::skeleton {
@@ -80,6 +81,12 @@ bool frontierPathTraversable(const Geometry& g,const std::vector<cv::Point2d>& p
     if(!visible(g,path[i-1],path[i],state,endpoint_is_frontier&&i+1==path.size()))return false;
   return true;
 }
+bool frontierAssociationClear(const Geometry& g,cv::Point2d approach,cv::Point2d centroid,
+    const std::function<uint8_t(cv::Point)>& state) {
+  return visible(g,approach,centroid,[&](cv::Point p)->uint8_t {
+    auto value=state(p);return value==UNKNOWN?FREE:value;
+  },false);
+}
 uint64_t frontierFingerprint(const std::vector<Frontier>& frontiers) {
   std::vector<uint64_t> hashes;
   for(const auto& f:frontiers) {
@@ -95,10 +102,13 @@ uint64_t frontierFingerprint(const std::vector<Frontier>& frontiers) {
   for(auto h:hashes)out=(out^h)*1099511628211ULL;
   return out;
 }
-std::vector<FrontierLink> connectFrontiers(const GridInput& in,const Graph& graph,const std::vector<Frontier>& frontiers) {
+std::vector<FrontierLink> connectFrontiers(const GridInput& in,const Graph& graph,const std::vector<Frontier>& frontiers,
+                                         double max_association_distance) {
   if(in.cells.type()!=CV_8UC1||in.cells.cols!=in.geometry.width||in.cells.rows!=in.geometry.height||
      !std::isfinite(in.geometry.resolution)||in.geometry.resolution<=0||!(in.geometry==graph.geometry))
     throw std::invalid_argument("Frontier link map geometry mismatch");
+  if(!std::isfinite(max_association_distance)||max_association_distance<=0)
+    throw std::invalid_argument("Frontier association distance must be positive and finite");
   std::vector<FrontierLink> links;
   if(frontiers.empty())return links;
   auto state=[&](cv::Point p)->uint8_t{return p.x>=0&&p.y>=0&&p.x<in.cells.cols&&p.y<in.cells.rows?in.cells.at<uint8_t>(p):BLOCKED;};
@@ -143,55 +153,68 @@ std::vector<FrontierLink> connectFrontiers(const GridInput& in,const Graph& grap
   for(const auto& f:frontiers) {
     FrontierLink c;c.frontier_id=f.id;c.active=f.active;c.centroid=f.centroid;c.geometry_signature=frontierFingerprint({f});
     if(sources.empty()){c.reason="NO_JUNCTION";links.push_back(std::move(c));continue;}
-    auto target=gridCell(in.geometry,f.centroid);
-    bool endpoint_is_frontier=std::find(f.cells.begin(),f.cells.end(),target)!=f.cells.end();
-    bool terminal_unknown=state(target)==UNKNOWN&&endpoint_is_frontier;
-    if(!free(target)&&!terminal_unknown) {
+    if(!std::isfinite(f.centroid.x)||!std::isfinite(f.centroid.y)) {
       c.reason="FRONTIER_CENTER_BLOCKED";links.push_back(std::move(c));continue;
     }
-    // Choose the centre itself, or its immediate known-free side. Do not choose
-    // an arbitrary distant point on a long Frontier and append a long hook.
-    std::vector<cv::Point> approaches;
-    if(free(target))approaches.push_back(target);
-    else for(auto d:{cv::Point(1,0),cv::Point(-1,0),cv::Point(0,1),cv::Point(0,-1)})
-      if(free(target+d))approaches.push_back(target+d);
-    int best=-1;double best_cost=inf;
-    for(auto q:approaches) {
-      int idx=index(q);
-      if(!visible(in.geometry,in.geometry.world(q),f.centroid,state,terminal_unknown))continue;
-      double cost=distance[idx]+cv::norm(in.geometry.world(q)-f.centroid);
-      if(cost<best_cost){best=idx;best_cost=cost;}
+    auto target_position=gridPosition(in.geometry,f.centroid);
+    if(target_position.x<0||target_position.y<0||target_position.x>=in.geometry.width||target_position.y>=in.geometry.height) {
+      c.reason="FRONTIER_CENTER_BLOCKED";links.push_back(std::move(c));continue;
     }
-    if(best<0){c.reason=approaches.empty()?"NO_FREE_APPROACH":"UNREACHABLE";links.push_back(std::move(c));continue;}
+    auto target=gridCell(in.geometry,f.centroid);
+    if(!free(target)&&state(target)!=UNKNOWN) {
+      c.reason="FRONTIER_CENTER_BLOCKED";links.push_back(std::move(c));continue;
+    }
+    // Centroids of curved boundaries often lie in nonmember Unknown cells.
+    // Pick a reachable FREE side of an actual boundary cell near that centroid;
+    // the remaining short association is never part of the traversable path.
+    std::set<std::pair<int,int>> approaches;
+    if(free(target))approaches.emplace(target.x,target.y);
+    else for(auto p:f.cells)if(state(p)==UNKNOWN)
+      for(auto d:{cv::Point(1,0),cv::Point(-1,0),cv::Point(0,1),cv::Point(0,-1)}) {
+        auto q=p+d;if(!free(q))continue;
+        auto world=in.geometry.world(q);
+        if(cv::norm(world-f.centroid)<=max_association_distance+1e-9&&
+           frontierAssociationClear(in.geometry,world,f.centroid,state))approaches.emplace(q.x,q.y);
+      }
+    int best=-1;double best_gap=inf,best_cost=inf;
+    for(auto [x,y]:approaches) {
+      cv::Point q(x,y);int idx=index(q);if(owner[idx]<0)continue;
+      auto approach=free(target)?f.centroid:in.geometry.world(q);
+      if(!visible(in.geometry,in.geometry.world(q),approach,state,false))continue;
+      double gap=cv::norm(approach-f.centroid);
+      double cost=distance[idx]+cv::norm(in.geometry.world(q)-approach);
+      if(gap<best_gap-1e-9||(std::abs(gap-best_gap)<=1e-9&&cost<best_cost)) {
+        best=idx;best_gap=gap;best_cost=cost;
+      }
+    }
+    if(best<0){c.reason=approaches.empty()?"NO_NEARBY_FREE_APPROACH":"UNREACHABLE";links.push_back(std::move(c));continue;}
     const auto* junction=sources[owner[best]].node;
-    c.approach=in.geometry.world(point(best));
+    c.approach=free(target)?f.centroid:in.geometry.world(point(best));
     for(int p=best;;p=parent[p]){c.pixels.push_back(point(p));if(parent[p]==p)break;}
     std::reverse(c.pixels.begin(),c.pixels.end());for(auto p:c.pixels)c.path.push_back(in.geometry.world(p));
     auto route=c.path;
     if(cv::norm(route.front()-junction->position)>1e-9)route.insert(route.begin(),junction->position);
-    if(cv::norm(route.back()-f.centroid)>1e-9)route.push_back(f.centroid);
-    c.display_path=shorten(in.geometry,route,state,terminal_unknown);
+    if(cv::norm(route.back()-c.approach)>1e-9)route.push_back(c.approach);
+    c.display_path=shorten(in.geometry,route,state,false);
     if(c.display_path.empty()){c.reason="UNREACHABLE";c.path.clear();c.pixels.clear();links.push_back(std::move(c));continue;}
     c.length=pathLength(c.display_path);
     // A grid's eight directions can slightly bias the owner. Prefer any
-    // shorter verified direct connection to the actual node/Frontier centres.
+    // shorter verified direct connection to the same safe approach.
     for(const auto& source:sources) {
-      double length=cv::norm(source.node->position-f.centroid);
-      if(length>=c.length-1e-9||!visible(in.geometry,source.node->position,f.centroid,state,terminal_unknown))continue;
-      junction=source.node;c.display_path={junction->position,f.centroid};c.length=length;
+      double length=cv::norm(source.node->position-c.approach);
+      if(length>=c.length-1e-9||!visible(in.geometry,source.node->position,c.approach,state,false))continue;
+      junction=source.node;c.display_path={junction->position,c.approach};c.length=length;
     }
     // Keep the raster witness for the FINAL shortened route, not the discarded
-    // grid detour. Unknown is permitted only in the final Frontier cell.
+    // grid detour. Every path cell, including the endpoint, is known FREE.
     c.pixels.clear();c.path.clear();
     if(c.display_path.size()==1)c.pixels.push_back(gridCell(in.geometry,c.display_path.front()));
     for(size_t i=1;i<c.display_path.size();++i) {
       std::vector<cv::Point> raster;
-      visible(in.geometry,c.display_path[i-1],c.display_path[i],state,
-              terminal_unknown&&i+1==c.display_path.size(),&raster);
+      visible(in.geometry,c.display_path[i-1],c.display_path[i],state,false,&raster);
       for(auto p:raster)if(c.pixels.empty()||c.pixels.back()!=p)c.pixels.push_back(p);
     }
     for(auto p:c.pixels)c.path.push_back(in.geometry.world(p));
-    c.approach=c.path.back();
     c.connected=true;c.reason="CONNECTED";c.junction_id=junction->id;
     links.push_back(std::move(c));
   }

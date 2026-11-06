@@ -1,6 +1,6 @@
 # Skeleton Graph：独立的长期几何骨架
 
-这是 APEXNAV 全局二维几何地图的只读观察模块，使用 `skeleton:=true` 开启。当前默认移除红色 Deadend，合并距离小于 2m 的绿色 Junction，并将现有动态 Frontier 关联至绿色节点；显示连线接到原前沿节点中心。它不使用已暂停的 `--planner TOPOLOGY` / 深度描述子图，不输出运动指令，不改变 Frontier 生命周期、语义投影、目标选择或 MPC。本阶段不保存语义、图片和磁盘快照。
+这是 APEXNAV 全局二维几何地图的只读观察模块，使用 `skeleton:=true` 开启。当前默认移除红色 Deadend，保留绿色 Junction 的实际骨架位置，并将现有动态 Frontier 关联至绿色节点；显示连线接到原前沿节点中心。它不使用已暂停的 `--planner TOPOLOGY` / 深度描述子图，不输出运动指令，不改变 Frontier 生命周期、语义投影、目标选择或 MPC。骨架模块自身不保存语义、图片和磁盘快照；持久化由独立 UTM 模块负责。
 
 “长期”指以当前 episode 累积的全局已知自由空间为基础，不随相机视野和动态 Frontier 删除而遗忘；不是跨仿真保存。退出仿真保留图，下一轮原 `/exploration/reset` 重建地图时统一清空。全量重建可能因真实几何变化、分支剪枝而移除已失效节点。
 
@@ -39,12 +39,14 @@
 4. 度为 1 的像素是 Endpoint，度为 2 的 Connector 只进入边路径，度大于等于 3 的相邻像素聚成 Junction。代表点选择簇内实际骨架像素；边通过簇内骨架连接至代表点，不画穿越障碍的质心直线。
 5. 沿 Connector 追踪并压缩成 Edge；保留全部像素和世界坐标路径，长度为相邻路径段的欧氏距离和。
 6. 没有 Endpoint/Junction 的闭环设一个 `LOOP_ANCHOR` 和一条首尾闭合的 self-edge。允许两节点间多条不同路径，不能简单按端点 ID 去重。
-7. 按实际米制长度剪除短的 Endpoint–Junction 叶分支，重复压缩直到稳定。此几何剪枝默认保护 Unknown 附近的 Endpoint；不根据通道宽度删除。单独的孤立像素被丢弃。
-8. 消除填满 2×2 骨架像素面造成的假环，包括多个相邻填满面的组合。用无向像素边的 XOR 基判别冗余路径，不删除连接外部通道的像素；真实 Unknown/障碍孔洞周围的环保留。
-9. `remove_deadends=true` 时再统一过滤邻居为 1 的正式 Endpoint 及其关联边，包括 Unknown 附近的端点和独立 Endpoint–Endpoint 走廊。这是一次性端点过滤，不递归删除绿色 Junction：即使 Junction 暂时只剩 0/1 个骨架邻居，也保留供动态 Frontier 关联。Loop Anchor 不属于 Deadend。设置 false 可查看原始端点图。
-10. `junction_merge_distance=2.0` 时反复合并当前距离最近且小于阈值的两个 Junction 簇；两个点精确取中点，多点取原成员等权平均，避免反复取两点中点导致偏移。阈值使用世界坐标欧氏距离，恰好 2m 不合并，0 关闭。Endpoint/Loop Anchor 不参与。合并后更新节点 ID 对应关系、外部边和邻居；内部生成树边折叠，非树边和原自环保留为图中的环。
+7. 对 Endpoint–Junction 叶分支执行长度/宽度剪枝，删除骨架像素并重复追踪、压缩和节点分类直到稳定。长度小于 `min_branch_length`，或末端采样段最大估计宽度小于 `min_deadend_width`，任一条件成立即剪除。宽度取从 Endpoint 出发、沿路径长度前 `deadend_width_sample_fraction` 部分的最大 `2 × clearance`，不包含 Junction 簇像素。采用最大值避免仅因贴墙端点的低净空而误删宽支线，采样末端段避免路口开阔区域掩盖窄凹槽。该宽度是膨胀后已知自由区域的保守直径估计，不是原始墙间距。Unknown 附近不再免剪，`near_unknown_boundary` 仅为元数据。独立 Endpoint–Endpoint 分量也检查总长度与整条路径的最大 `2 × clearance`，短线或整条线都窄时删除整个分量；长度和宽度正常的独立走廊保留。Junction–Junction 边不直接参与叶分支剪枝。单独的孤立像素被丢弃。
+另对 Endpoint 到实际前沿边界的可通行距离进行剪枝：输入复用 FrontierMap2D 当前 active/dormant Frontier 的完整成员栅格，不使用质心。以真实 UNKNOWN 前沿格与未膨胀 FREE 格的共有边界为源，自由格中心到边界初始距离为半个 resolution；执行限距八邻域多源 Dijkstra，禁止穿过 Unknown、障碍、膨胀区域或斜向穿角。距离严格小于 `frontier_deadend_distance`（默认 0.20m）时剪除 Endpoint 所属末端支线；独立 Endpoint–Endpoint 分量任一端满足时删除整条独立边。0 关闭此规则。普通 Unknown 格不自动当作 Frontier。删除发生在临时骨架像素中，随后重新追踪/分类，原始占据地图及 Frontier 不变。
 
-合并中心是抽象拓扑位置，可能不在骨架上甚至落在障碍/Unknown 中，按请求不强行吸附回自由格。`pixel_x/y` 表示该中心所在栅格；`anchor_pixel_x/y` 保留合并前的真实骨架位置。`clearance`、`near_unknown_boundary` 查询中心所在格，阻塞格 clearance=0。节点合并不证明成员之间可直接通行。本模块只用于表示和显示，原 ApexNav 控制不使用合并中心。
+8. 消除填满 2×2 骨架像素面造成的假环，包括多个相邻填满面的组合。用无向像素边的 XOR 基判别冗余路径，不删除连接外部通道的像素；真实 Unknown/障碍孔洞周围的环保留。
+9. `remove_deadends=true` 时再统一过滤邻居为 1 的正式 Endpoint 及其关联边，包括 Unknown 附近的端点和独立 Endpoint–Endpoint 走廊。这是一次性端点过滤，不递归删除绿色 Junction：即使 Junction 暂时只剩 0/1 个骨架邻居，也保留供动态 Frontier 关联。Loop Anchor 不属于 Deadend。设置 false 可保留经过长度/宽度剪枝后的端点。
+10. 已移除按世界距离合并 Junction、坐标平均及连接到平均中心的显示补线。不同路口即使很近也保留各自真实位置；第 4 步对同一片连续分岔像素的聚类仍保留。
+
+节点使用实际自由骨架代表像素；`pixel_x/y` 与 `position` 对应。为兼容已有 ROS/UTM 读取接口，`anchor_pixel_x/y` 只包含该代表像素，消息中的旧 `merged_junctions` 字段固定为 0。新的 Skeleton Edge 的 `display_path` 与完整实际 `path` 相同。
 
 Clearance 是**膨胀后可通行区域到非通行边界的保守余量**，包含 Unknown 和地图外部。由临时欧氏距离场减去半个格子的对角长度后换算成米，不等于原始障碍点中心距离，也不替代控制器原有碰撞判断。节点取代表像素 Clearance，边取完整路径的最小值。
 
@@ -52,22 +54,22 @@ Clearance 是**膨胀后可通行区域到非通行边界的保守余量**，包
 
 默认最多每秒检查一次，不在深度回调里细化。状态没有变化时不重建，log-odds 数值小幅变化但三态/膨胀分类相同也不重建。指纹比较基准为**上次成功构图的输入**，小变化会累计，不会被每次轮询覆盖掉。
 
-节点按相同类型、世界坐标距离由近到远一一匹配，匹配距离可配置；未匹配的新节点分配递增 ID。全量细化的骨架可能随自由区域扩张而移动，因此 ID 为尽力保留，不是所有形变下都保证不变。合并后的 Junction 使用最终中心参与类型/距离 ID 匹配；首次合并或合并分组变化时可能分配新 ID。当前有效图中的节点 `active=true`，不保留无效历史节点表。Unknown 边界端点使用 `near_unknown_boundary=true` 标记暂时性。
+节点按相同类型、世界坐标距离由近到远一一匹配，匹配距离可配置；未匹配的新节点分配递增 ID。全量细化的骨架可能随自由区域扩张而移动，因此 ID 为尽力保留，不是所有形变下都保证不变。节点使用实际骨架代表位置进行类型/距离 ID 匹配。当前有效图中的节点 `active=true`，不保留无效历史节点表。Unknown 边界端点使用 `near_unknown_boundary=true` 标记暂时性。
 
-## 动态 Frontier 连接（2026-11-03 更新）
+## 动态 Frontier 连接（2026-11-05 更新）
 
 直接读取同一 `SDFMap2D` 所属 `FrontierMap2D::activeFrontiers()/dormantFrontiers()`，沿用原 Frontier ID、几何质心、成员栅格及 active/dormant 状态，不重新提取或评分，不复制图片或语义数据。
 
-前沿连接从 **当前 Junction 中心** 所在的自由格展开，不再使用合并前的锚点作为起点。先用八邻域多源 Dijkstra 求栅格最短路径，代价包含中心到栅格中心及终点段；对角移动要求两个正交侧格也可通行。之后逐段做栅格射线检查，删除可以直接跨越的中间折点；无遮挡时从当前绿点到原 Frontier 中心直接连成一段。若其他 Junction 存在更短的直视连线，也会选用该连线。绕障路径是栅格最短路加可视简化，不宣称连续平面中严格全局最短。
+前沿连接从 **当前 Junction 中心** 所在的自由格展开，使用八邻域多源 Dijkstra 求到自由接近点的路径；对角移动要求两个正交侧格也可通行。之后用栅格射线检查简化路径；无遮挡时直接连接绿点和接近点，也会检查其他 Junction 是否有更短的直视连接。绕障路径是栅格最短路加可视简化，不宣称连续平面中严格全局最短。
 
-原 Frontier 的成员格子是 Unknown，非凸边界的质心也可能落在 Unknown/障碍中。`display_path` 从当前 Junction 中心重新计算至 `frontier_centroid`，不再拼接“新中心→旧节点→远处边界→前沿中心”。只允许最后一个格子为属于此 Frontier 的 Unknown，其余全部须 FREE 且未膨胀。`path/pixel_x/pixel_y` 保存最终简化路线经过的自由格作为几何依据，`approach` 是最后一个自由格的中心。RViz 使用 `display_path`。最后一个 Marker 点的高度为 0.36m，与原 Frontier 球体/方块中心相同，`F<id>` 标签也位于原前沿中心旁；不再绘制额外的接入小球。
+原 Frontier 的成员格子是 Unknown，弯曲边界的质心可能不属于任何成员格。保留质心和编号：质心在已知自由格时直接使用；在 Unknown 时，从实际边界成员格四邻域的未膨胀自由格中，选择距质心最近且可达的接近点，同距离时优先较短路径。接近点到质心默认不得超过 0.50m，关联线不得穿过地图分类中的障碍或膨胀格。`display_path` 只保存 Junction 到 `approach` 的简化安全路径，`path/pixel_x/pixel_y` 保存该路径的自由格依据；任何安全路径点都不进入 Unknown。RViz 用青色实线显示安全路径，用橙色虚线连接 `approach` 和原球心；虚线仅表示拓扑关联，不可供运动控制执行。球体及 `F<id>` 标签位置不变。
 
-Frontier 的 `length` 为最终 `display_path` 的完整长度，包含端点段。节点中心在障碍/膨胀/Unknown 内时不作为可达起点；前沿中心落在障碍、地图外或不属于当前 Frontier 的 Unknown 中时发布 `FRONTIER_CENTER_BLOCKED`，不再补未经检查的长连线。每次发布前也对当前地图重新验证简化后的整条线段，不能仅检查简化前的栅格路径。蓝色骨架 Edge 仍保留原始骨架几何及抽象中心显示连接；本次仅修正青色 Frontier 关联，不改变导航控制。
+Frontier 的 `length` 为安全 `display_path` 的长度，不含虚线。若 Junction 本身就是接近点，可保存单点、零长度路径。前沿中心位于障碍、膨胀格或地图外时仍发布 `FRONTIER_CENTER_BLOCKED`。每次发布前重新验证整条安全路径和关联线；蓝色骨架 Edge 继续显示原始骨架路径，不改变导航控制。
 
 - Frontier 增删、成员变化、active/dormant 变化都会刷新连接，即使占据地图没有变化。
 - 任何地图分类块变化也会刷新连接，即使不足以触发骨架全量重建；打开一格门或捷径后可以重新连通、重新选择最近 Junction。连接刷新不覆盖骨架变化累计基准。
 - 异步结果提交时再次核对 Frontier 身份与成员、当前地图的路径可通行性；过期 Frontier 记录直接丢弃，失效路径标记 `MAP_CHANGED` 并重新计算。
-- 没有绿色 Junction、没有安全接入点、不可达时，分别发布 `NO_JUNCTION`、`NO_FREE_APPROACH`、`UNREACHABLE`，`connected=false`，不生成虚假的连线。纯直线走廊过滤 Endpoint 后可能没有 Junction，这是本版“只连绿色路口”的明确边界；原 ApexNav 探索照常运行。
+- 没有绿色 Junction、限定距离内没有合适自由接近点、接近点不可达时，分别发布 `NO_JUNCTION`、`NO_NEARBY_FREE_APPROACH`、`UNREACHABLE`，`connected=false`。纯直线走廊过滤 Endpoint 后可能没有 Junction，原 ApexNav 探索照常运行。
 - 这些关联只是图数据和可视化，不修改全局目标选择、局部规划或速度输出。骨架节点的 `neighbor_count` 仍只统计骨架邻居，动态关联单独存于 `frontier_links`。
 
 ## 数据接口
@@ -75,13 +77,13 @@ Frontier 的 `length` 为最终 `display_path` 的完整长度，包含端点段
 - `/skeleton_graph/graph`：`plan_env/msg/SkeletonGraph`，Reliable + Transient Local，深度 1。包含地图元数据、revision、采样时间、统计、节点、完整边和当前 `frontier_links`。
 - `/skeleton_graph/markers`：`visualization_msgs/msg/MarkerArray`，同样保留最新一份供后打开的 RViz 订阅。
 
-节点字段：`node_id`、`node_type`（0 ENDPOINT / 1 JUNCTION / 2 LOOP_ANCHOR）、`pixel_x/y`、世界坐标 `position`、合并前 `anchor_pixel_x/y`、`neighbor_node_ids`、`neighbor_count`、`clearance`、`near_unknown_boundary`、`active`。
+节点字段：`node_id`、`node_type`（0 ENDPOINT / 1 JUNCTION / 2 LOOP_ANCHOR）、`pixel_x/y`、世界坐标 `position`、仅包含实际代表像素的兼容字段 `anchor_pixel_x/y`、`neighbor_node_ids`、`neighbor_count`、`clearance`、`near_unknown_boundary`、`active`。
 
 边字段：`edge_id`、`start_node_id`、`end_node_id`、原始完整 `pixel_x/y` 和世界坐标 `path`、中心到中心的 `display_path`、几何 `length`、`min_clearance`。邻居数是去重后的邻居 ID 数；闭环自身算一个邻居，不能将该数误作包含重边的图论度数。
 
-新增 `SkeletonFrontierLink` 字段：`frontier_id`、`active`、`connected`、`junction_node_id`、原 `frontier_centroid`、安全 `approach`、完整 `pixel_x/y` 和世界坐标 `path`、中心到中心的 `display_path`、该完整连线的米制 `length`、`reason`。只有 `connected=true` 时路径与接入位置有效。图消息增加 `removed_deadends`、`merged_junctions`、`geometry_rebuilt`、`frontier_link_ms` 统计。
+`SkeletonFrontierLink` 字段：`frontier_id`、`active`、`connected`、`junction_node_id`、原 `frontier_centroid`、安全 `approach`、完整 `pixel_x/y` 和世界坐标 `path`、至接近点的安全 `display_path`、安全路径米制 `length`、`reason`。关联段由 `approach` 和 `frontier_centroid` 确定。只有 `connected=true` 时路径与接入位置有效。图消息提供 `removed_deadends`、`geometry_rebuilt`、`frontier_link_ms` 统计；旧 `merged_junctions` 仅为消息兼容保留，固定为 0。
 
-Marker 每次先 DELETEALL，再发布完整当前图：边蓝色，Endpoint 红色，Junction 绿色，Loop Anchor 紫色，默认标节点 ID；默认不再有红色 Endpoint。前沿连接为直达原 Frontier 球体/方块中心的青色折线，标签 `F<id>`。Marker 仅提升 z 避免被栅格覆盖，图消息的几何 z=0。
+Marker 每次先 DELETEALL，再发布完整当前图：边蓝色，Endpoint 红色，Junction 绿色，Loop Anchor 紫色，默认标节点 ID；默认不再有红色 Endpoint。前沿安全连接为青色实线（`frontier_links`），接近点到原球心为橙色虚线（`frontier_associations`），标签 `F<id>`。Marker 仅提升 z 避免被栅格覆盖，图消息的几何 z=0。
 
 ## 参数
 
@@ -93,12 +95,16 @@ Marker 每次先 DELETEALL，再发布完整当前图：边蓝色，Endpoint 红
 | `change_tile_size` | 32 | 指纹块边长，像素；0.05m 分辨率下为 1.6m |
 | `min_changed_tiles` | 1 | 至少多少块分类变化才重建，可调大减少微小更新 |
 | `min_changed_ratio` | 0.0 | 另一触发条件，变化块/全部块；0 关闭，与块数条件为 OR |
-| `min_branch_length` | 0.30m | 叶分支长度阈值；0 关闭剪枝 |
-| `unknown_boundary_distance` | 0.50m | 到 Unknown 像素中心的距离阈值 |
-| `protect_unknown_endpoints` | true | 几何短分支剪枝保护；不阻止后续统一移除 Deadend |
+| `min_island_area` | 1.0 m² | 除最大自由连通分量外，面积低于此值的独立区域不参与骨架生成；0 关闭 |
+| `min_branch_length` | 0.40m（当前 YAML；代码回退 0.30m） | 叶分支长度阈值；0 只关闭长度剪枝 |
+| `min_deadend_width` | 0.20m | 末端采样段最大 `2 × clearance` 低于此值即剪枝；0 关闭宽度剪枝 |
+| `deadend_width_sample_fraction` | 0.50 | Endpoint–Junction 从端点出发的采样弧长比例；独立 Endpoint–Endpoint 使用全长 |
+| `frontier_deadend_distance` | 0.20m | 到实际前沿边界的可通行距离；严格小于时剪枝；0 关闭 |
+| `unknown_boundary_distance` | 0.50m | 仅用于 near_unknown_boundary 标记，不影响剪枝 |
 | `remove_deadends` | true | 移除正式单邻居 Endpoint 与关联边，保留绿色 Junction |
 | `connect_frontiers` | true | 当前 active/dormant Frontier 连接最近可达 Junction |
-| `junction_merge_distance` | 2.0m | 小于阈值的 Junction 按当前最近簇合并，0 关闭 |
+| `frontier_max_association_distance` | 0.50m | 自由接近点到前沿质心的最大距离 |
+| `frontier_association_dash_length` | 0.04m | 橙色关联虚线每段长度，间隔同长 |
 | `frontier_visualization_z` | 0.36m | 前沿连线终点高度，与现有前沿节点一致 |
 | `node_match_distance` | 0.40m | 同类节点 ID 匹配最大距离 |
 | `visualization_z` | 0.12m | 显示高度 |
@@ -197,7 +203,7 @@ ros2 param get /exploration_node skeleton_graph.enabled
 | 十字走廊 | 4 Endpoint，1 Junction，4 Edge |
 | 多分支走廊 | 4 Endpoint，2 Junction，5 Edge，中间 Connector 已压缩 |
 | 0.3m 噪声叶分支、剪枝阈值 0.4m | 剪除后 2 Endpoint、1 Edge；长窄分支保留 |
-| 同一短分支面向 Unknown | 标记 near_unknown_boundary，默认不剪除 |
+| 同一短分支面向 Unknown | 同样剪除；关闭剪枝时仍保留 near_unknown_boundary 标记 |
 | 闭合矩形环 | 1 Loop Anchor、1 闭合 Edge，完整周长 20m |
 
 额外覆盖：L 拐角不增加假分支、真正对角线保持连通、地图边缘、孤立像素、非零 origin/旋转/分辨率、重复构图和小幅扩展保持 ID、变化阈值累计、厚十字路口、平行通路、膨胀障碍截断、全 Unknown/Occupied、frame 变化不错误匹配。审查发现并修复 Junction 簇内部闭环被吞掉的问题，新增菱形小环及四个外分支的回归：合并后 5 节点、5 边，保留一条闭环边。
@@ -243,6 +249,8 @@ PYTHONPATH=.:$PYTHONPATH python -m unittest discover -s tests -p 'test_*.py'
 
 ## 节点中心连接与 2m 合并更新
 
+以下为历史实现记录。2026-11-04 已删除距离合并和平均位置逻辑，当前行为以本文开头说明为准。
+
 本次修改 `skeleton_graph.{h,cpp}`、`skeleton_frontier_links.{h,cpp}`、`skeleton_graph_manager.{h,cpp}`、四个 Skeleton 消息、`skeleton_graph.yaml` 和相关测试。原 Frontier、语义、建图、局部规划与控制模块未修改。
 
 用户要求自行检查实际效果，因此本轮仅做编译和小型核心逻辑检查，不执行新的 Habitat 仿真、ROS 集成实验或全量测评。保留并更新测试脚本，供需要时手动运行。`plan_env`、`exploration_manager` 两包编译通过；两个小型核心程序通过前沿中心连线、2m 阈值、两点中点、多点平均、关联边更新、真实环和几何锚点检查。未运行本轮 ROS/Habitat 集成实验。构建日志：容器 `/tmp/skeleton_centers_merge_build.log`。
@@ -267,3 +275,33 @@ RViz 继续使用 Skeleton Graph 和原 Frontier 显示；原仿真命令不变�
 只做小型核心程序和编译检查：开放区域合并节点到 Frontier 为单条直线，7 格×0.1m 的连线长度为 0.7m；墙体绕行、Unknown/膨胀/穿角排除、阻塞中心拒绝等检查通过。未启动新的 ROS/Habitat 仿真实验。
 
 现有规划器运行期间在 `build/skeleton_link_fix` 单独编译 plan_env（通过），再原子替换常用 `install/plan_env/lib/libplan_env_lib.so`，旧进程仍使用旧库。**无需额外 source overlay，重启规划器后加载新库**。构建日志：容器 `/tmp/skeleton_link_fix_build.log`。
+
+
+### 前沿驱动的几何剪枝更新
+
+启用 `frontier_deadend_distance` 后，即使 `connect_frontiers=false`，也读取当前前沿成员以执行剪枝。前沿签名变化（包括前沿消失）或地图 tile 变化会触发骨架全量重建，仍受 `update_hz` 限制。异步结果按采样快照发布；若计算期间前沿已变化，会立即提交下一轮重建，避免连续运动时因反复丢弃快照而无法发布。关闭此剪枝时恢复原有几何变化阈值与链接独立更新逻辑。
+
+新增轻量测试覆盖：孤立短线、长而窄的独立分量删除，正常宽走廊保留；真实前沿边界距离、阈值相等不删、隔墙绕行、禁止穿角、过期前沿格过滤、前沿消失后从原占据地图恢复骨架。
+
+
+### 几何小孤岛过滤
+
+在临时二值图 `FREE && !inflated` 上做四邻域连通域分析，按 `像素数 × resolution²` 计算面积。最大自由连通分量始终保留；其他面积严格小于 `min_island_area`（ROS 默认 1.0m²）的独立区域从临时图中移除，不再生成骨架节点和边。0 关闭过滤。四邻域避免角点接触产生假连通；不需要机器人位置或额外里程计订阅。
+
+这是几何小区域过滤，不声称判断机器人实际可达性。较大的独立区域仍保留，避免把完整房间当成噪声。原始占据/膨胀地图、Frontier 和语义信息不修改，RViz 原地图里的自由格仍可能可见。地图连通性变化后在 `update_hz` 限制内重新提取：通道打开时，原小岛成为大区域的一部分，可以重新生成骨架。
+
+测试覆盖：小孤岛删除、大独立房间保留、最大区域即使较小也保留、开口恢复、膨胀隔断、禁止角点连接、原地图只读，以及不依赖里程计的 ROS 地图到骨架链路。
+
+
+### 前沿代表点落在真实边界上
+
+`FrontierMap2D::computeFrontierInfo()` 先求成员格的几何平均，再选取距离平均最近的实际成员格作为代表点；等距离时按世界坐标 x/y 排序稳定选择。保留现有 `average_` / 消息 `centroid` 字段名，但其当前值表示边界代表点。RViz 球体、Frontier 几何输出、语义节点位置、骨架关联及 UTM 新快照沿用同一个位置；成员格、分组编号、每格语义融合不变。旧磁盘记录不回写，重启后按新提取结果更新。被禁用的 PCA 拆分若未来启用，仍另算真实均值。
+
+代表点修正本身不合并分组（相邻 Frontier 合并见下节），也不合并相近 Junction；不修改 deadend 到前沿的距离计算或阈值。前沿仍属于 Unknown 边界，代表点不是机器人可直接到达的控制目标；现有连接仍先验证自由空间接近点。
+
+
+### 增量提取后的相邻前沿组合并
+
+`searchFrontiers()` 在新组分配 ID 后、语义同步前调用 `mergeAdjacentFrontiers()`。按实际成员栅格的八邻域连接关系（与现有区域生长一致）合并活动和休眠前沿，包括首尾相接的多组；不使用代表点之间的距离，也不跨越缺失的边界格。合并保留最小（最早）编号、去重成员格、重算包围盒和真实边界代表点；任一成员组活动则结果活动，否则仍休眠。强制休眠组不参与。
+
+合并完成后只同步一次语义几何，保留仍存活成员格的 token 和融合证据，节点分数继续取逐格融合结果的最大值。骨架连接和 UTM 当前状态随后沿用合并结果；旧节点的历史图片文件不在此处迁移或删除。不修改 Junction 合并规则、deadend 剪枝距离或阈值。

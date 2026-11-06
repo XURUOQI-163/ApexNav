@@ -19,7 +19,6 @@ int main(int argc,char** argv) {
   node->declare_parameter("sdf_map.max_ray_length",2.5);
   node->declare_parameter("skeleton_graph.update_hz",10.);
   node->declare_parameter("skeleton_graph.remove_deadends",false);
-  node->declare_parameter("skeleton_graph.junction_merge_distance",0.);
   auto map=std::make_unique<SDFMap2D>();map->initMap(node,false);
   auto cloud=pcl::make_shared<pcl::PointCloud<pcl::PointXY>>();
   for(int i=-100;i<=100;++i){pcl::PointXY p;p.x=i*.02f;p.y=.8f;cloud->push_back(p);p.y=-.8f;cloud->push_back(p);}

@@ -74,6 +74,7 @@ from habitat2ros.episode_reset import reset_episode, finish_episode
 from llm.answer_reader.answer_reader import read_answer
 from params import HABITAT_STATE, ROS_STATE, ACTION, RESULT_TYPES
 from vlm.label_utils import resolve_navigation_target
+from habitat2ros.topology_context import publish_topology_context
 from habitat2ros.frontier_semantics import FrontierSemanticBridge
 from vlm.utils.get_object_utils import get_object
 
@@ -313,6 +314,7 @@ def main(cfg: DictConfig, node: HabitatEvalNode, step_delay: float = 0.0,
         del observations["camera_pitch"]
         label = resolve_navigation_target(env.current_episode.object_category,
                                           cfg.habitat.dataset.data_path, target_description)
+        publish_topology_context(node, env.current_episode, label, cfg.get('semantic_model', 'clip'))
         if custom_target:
             print(f'Custom target: {label}; scene={env.current_episode.scene_id}; '
                   f'episode_id={env.current_episode.episode_id}', flush=True)

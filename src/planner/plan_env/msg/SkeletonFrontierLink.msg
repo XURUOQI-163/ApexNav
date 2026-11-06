@@ -9,9 +9,10 @@ geometry_msgs/Point approach
 int32[] pixel_x
 int32[] pixel_y
 geometry_msgs/Point[] path
-# Checked, shortened route from CURRENT Junction centre to Frontier centroid.
-# Only its final Frontier cell may be UNKNOWN. path/pixels store the FREE raster witness.
+# Checked, shortened route from CURRENT Junction centre to the known-free approach.
+# Every point/segment is FREE. path/pixels store its FREE raster witness.
+# approach -> frontier_centroid is a separate drawing/association, NOT a safe path.
 geometry_msgs/Point[] display_path
-# Full centre-to-centre display_path length, including terminal Frontier segment.
+# Length of safe display_path only; excludes the drawing/association segment.
 float64 length
 string reason

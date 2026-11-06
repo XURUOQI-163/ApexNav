@@ -13,6 +13,7 @@
 #include <plan_env/msg/multiple_masks_with_confidence.hpp>
 #include <plan_env/msg/semantic_score.hpp>
 #include <plan_env/msg/frontier_scan.hpp>
+#include <plan_env/msg/frontier_memory_state.hpp>
 #include <plan_env/semantic_observation_cache.h>
 #include <plan_env/sdf_map2d.h>
 #include <plan_env/object_map2d.h>
@@ -110,6 +111,9 @@ private:
   void publishConfidenceMap();
   void publishFrontierLabels();
   void publishFrontierGeometry();
+  void publishFrontierMemory();
+  rclcpp::Publisher<plan_env::msg::FrontierMemoryState>::SharedPtr frontier_memory_pub_;
+  rclcpp::TimerBase::SharedPtr frontier_memory_timer_;
   rclcpp::Publisher<plan_env::msg::FrontierScan>::SharedPtr frontier_scan_pub_;
   double frontier_color_min_ = .1, frontier_color_max_ = .35;
   rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr frontier_geometry_pub_;

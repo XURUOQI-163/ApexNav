@@ -1,10 +1,23 @@
 #include <plan_env/frontier_semantic_memory.h>
+#include <plan_env/frontier_ids.h>
 #include <cassert>
 #include <cmath>
 #include <iostream>
 using namespace apexnav_planner;
 bool near(double a,double b) { return std::abs(a-b)<1e-8; }
 int main() {
+  // F67 -> F90 -> F92: direct and transitive adjacency must form one group.
+  std::vector<std::vector<std::pair<int,int>>> fragments={
+    {{733,662},{734,662}},{{735,662},{736,662}},{{737,662},{738,663}},{{742,662}}};
+  auto groups=adjacentFrontierGroups(fragments);
+  assert((groups==std::vector<std::vector<int>>{{0,1,2},{3}}));
+  std::reverse(fragments.begin(),fragments.end());
+  groups=adjacentFrontierGroups(fragments);
+  assert((groups==std::vector<std::vector<int>>{{0},{1,2,3}}));
+  assert((adjacentFrontierGroups({{{0,0}},{{1,1}}})==std::vector<std::vector<int>>{{0,1}}));
+  assert((adjacentFrontierGroups({{{0,0}},{{2,0}}})==std::vector<std::vector<int>>{{0},{1}}));
+  assert((adjacentFrontierGroups({{{0,0},{0,0}},{{0,0}}})==std::vector<std::vector<int>>{{0,1}}));
+  assert(adjacentFrontierGroups({}).empty());
   FrontierSemanticMemory m;
   std::vector<FrontierCellGeometry> cells{{10,1,0,1.,0.},{11,2,0,2.,0.}};
   m.sync({{1,1.5,0,true,{10,11}}},cells);
@@ -18,7 +31,11 @@ int main() {
   assert(near(m.cells().at(a).value,.4));
   m.sync({{2,1,0,true,{10}},{3,2,0,false,{11}}},cells);
   assert(near(m.nodes().at(2).value,.4) && near(m.nodes().at(3).value,.68));
+  const auto evidence_a=m.cellAt(10).evidence,evidence_b=m.cellAt(11).evidence;
   m.sync({{4,1.5,0,true,{10,11}}},cells);
+  assert(m.cellId(10)==a && m.cellId(11)==b);
+  assert(m.cellAt(10).evidence==evidence_a && m.cellAt(11).evidence==evidence_b);
+  assert(m.nodes().size()==1 && m.nodes().at(4).scored_cells==2);
   assert(near(m.nodes().at(4).value,.68)); // cluster IDs don't own evidence
   m.sync({{4,2,0,true,{11}}},{cells[1]});
   assert(!m.cells().count(a));

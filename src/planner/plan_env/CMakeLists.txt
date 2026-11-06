@@ -37,6 +37,10 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/SkeletonEdge.msg"
   "msg/SkeletonGraph.msg"
   "msg/SkeletonFrontierLink.msg"
+  "msg/FrontierMemoryCell.msg"
+  "msg/FrontierMemoryNode.msg"
+  "msg/FrontierMemoryState.msg"
+  "msg/TopologyObservation.msg"
   DEPENDENCIES std_msgs sensor_msgs geometry_msgs nav_msgs
 )
 
@@ -54,6 +58,7 @@ link_directories(${PCL_LIBRARY_DIRS})
 add_library(plan_env_lib SHARED
   src/sdf_map2d.cpp
   src/map_ros.cpp
+  src/map_ros_memory.cpp
   src/raycast2d.cpp
   src/perception_utils2d.cpp
   src/frontier_map2d.cpp

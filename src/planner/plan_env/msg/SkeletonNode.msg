@@ -6,7 +6,7 @@ uint8 node_type
 int32 pixel_x
 int32 pixel_y
 geometry_msgs/Point position
-# Original FREE skeleton anchors; merged position/pixel can lie in non-free space.
+# Wire compatibility: contains the one actual representative skeleton pixel.
 int32[] anchor_pixel_x
 int32[] anchor_pixel_y
 uint64[] neighbor_node_ids

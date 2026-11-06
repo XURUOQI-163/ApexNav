@@ -38,7 +38,7 @@ struct Frontier2D {
   /// Complete grid cells belonging to this frontier cluster
   vector<Vector2d> cells_;
 
-  /// Geometric centroid of all frontier cells
+  /// Actual member nearest the geometric mean (legacy name; not an arithmetic centroid)
   Vector2d average_;
 
   /// Unique identifier for this frontier cluster
@@ -72,6 +72,7 @@ public:
 private:
   enum FRONTIER_STATE { NONE, ACTIVE, DORMANT, FORCE_DORMANT };
   void expandFrontier(const Eigen::Vector2i& first);
+  void mergeAdjacentFrontiers();
   void splitLargeFrontiers(list<Frontier2D>& frontiers);
   bool splitHorizontally(const Frontier2D& frontier, list<Frontier2D>& splits);
   bool isFrontierChanged(const Frontier2D& ft);

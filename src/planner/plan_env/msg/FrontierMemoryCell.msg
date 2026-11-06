@@ -1,0 +1,9 @@
+uint64 token
+int32 pixel_x
+int32 pixel_y
+float64 x
+float64 y
+float64 fused_score
+float64 confidence
+float64 raw_similarity
+int64 last_frame_stamp_ns

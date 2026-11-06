@@ -170,6 +170,15 @@ void MapROS::init()
   frontier_labels_pub_ = node_->create_publisher<visualization_msgs::msg::MarkerArray>(
       "/frontier_semantics/labels", 10);
   frontier_scan_pub_ = node_->create_publisher<plan_env::msg::FrontierScan>("/frontier_semantics/scan", 20);
+  frontier_memory_pub_ = node_->create_publisher<plan_env::msg::FrontierMemoryState>(
+      "/topology_memory/frontier_state", rclcpp::QoS(1).reliable().transient_local());
+  if (!node_->has_parameter("topology_memory.snapshot_hz"))
+    node_->declare_parameter("topology_memory.snapshot_hz", 1.0);
+  const double memory_hz = node_->get_parameter("topology_memory.snapshot_hz").as_double();
+  if (!std::isfinite(memory_hz) || memory_hz <= 0. || memory_hz > 20.)
+    throw std::invalid_argument("topology_memory.snapshot_hz must be in (0,20]");
+  frontier_memory_timer_ = node_->create_wall_timer(
+      std::chrono::duration<double>(1. / memory_hz), std::bind(&MapROS::publishFrontierMemory, this));
   frontier_geometry_pub_ = node_->create_publisher<visualization_msgs::msg::MarkerArray>(
       "/frontier_semantics/markers", 10);
   if (!node_->has_parameter("frontier_visualization/score_min"))
