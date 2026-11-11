@@ -4,8 +4,12 @@ unified_topology_memory:
     frame_window_size: 20         # Original RGB + scan + odom exact timestamps
     observation_queue_size: 20    # Pinned scored frames may outlive the camera window
     node_match_distance: 0.50     # Metres; same-type one-to-one persistent ID recovery
-    max_observations_per_node: 8
+    save_frontier_images: false   # Opt-in Frontier JPEG persistence; semantic fusion stays enabled
+    max_frontier_observations_per_node: 8 # Used only when save_frontier_images=true
+    max_junction_observations_per_node: 4 # Also applies to LOOP_ANCHOR
+    max_deadend_observations_per_node: 1  # ENDPOINT
     keyframe_angle_degrees: 45.0
+    junction_keyframe_angle_degrees: 60.0 # New Junction view must differ from EVERY saved heading by >60deg
     keyframe_distance: 0.75       # Metres of camera displacement for a new view
     jpeg_quality: 90
     model_version: ''            # Optional explicit model/weights identifier; empty -> null

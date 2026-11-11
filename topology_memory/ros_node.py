@@ -24,8 +24,11 @@ class UnifiedTopologyMemoryNode(Node):
         super().__init__('unified_topology_memory')
         defaults = dict(directory=str(Path(__file__).resolve().parents[1] / 'data/topology'),
                         write_hz=1., frame_window_size=20, observation_queue_size=20,
-                        node_match_distance=.5, max_observations_per_node=8,
+                        node_match_distance=.5, save_frontier_images=False,
+                        max_frontier_observations_per_node=8,
+                        max_junction_observations_per_node=4, max_deadend_observations_per_node=1,
                         keyframe_angle_degrees=45., keyframe_distance=.75,
+                        junction_keyframe_angle_degrees=60.,
                         jpeg_quality=90, model_version='')
         for key, value in defaults.items():
             self.declare_parameter(key, value)
@@ -34,6 +37,8 @@ class UnifiedTopologyMemoryNode(Node):
             raise ValueError('Invalid UTM worker rate/window/queue capacity')
         if not 0 < p('keyframe_angle_degrees') <= 180 or p('keyframe_distance') <= 0 or not 1 <= p('jpeg_quality') <= 100:
             raise ValueError('Invalid UTM keyframe parameters')
+        if not 0 < p('junction_keyframe_angle_degrees') <= 180:
+            raise ValueError('Invalid Junction keyframe angle')
         directory = Path(p('directory')).expanduser().resolve()
         directory.mkdir(parents=True, exist_ok=True)
         self.writer_lock = (directory / '.writer.lock').open('a')
@@ -41,9 +46,13 @@ class UnifiedTopologyMemoryNode(Node):
             fcntl.flock(self.writer_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             raise RuntimeError(f'Another UTM recorder already writes {directory}')
-        self.memory = UnifiedTopologyMemory(directory, p('node_match_distance'), p('max_observations_per_node'))
+        self.memory = UnifiedTopologyMemory(directory, p('node_match_distance'), p('max_frontier_observations_per_node'),
+                                            save_frontier_images=p('save_frontier_images'),
+                                            max_junction_observations=p('max_junction_observations_per_node'),
+                                            max_deadend_observations=p('max_deadend_observations_per_node'))
         self.recorder = MemoryRecorder(self.memory, CvBridge(), p('frame_window_size'),
-                                       p('keyframe_angle_degrees'), p('keyframe_distance'), p('jpeg_quality'), p('model_version'))
+                                       p('keyframe_angle_degrees'), p('keyframe_distance'), p('jpeg_quality'), p('model_version'),
+                                       p('junction_keyframe_angle_degrees'))
         self.condition = threading.Condition()
         self.closed = False
         self.session_context = None
@@ -126,7 +135,7 @@ class UnifiedTopologyMemoryNode(Node):
                                   junctions=sum(n['status'] == 'ACTIVE' for n in self.memory.skeleton['nodes']),
                                   skeleton_edges=sum(e['status'] == 'ACTIVE' for e in self.memory.skeleton['edges']),
                                   active_frontiers=len(self.memory.get_active_frontiers()),
-                                  observations=sum(len(n['observations']) for n in self.memory.skeleton['nodes'] + self.memory.frontiers),
+                                  observations=sum(len(n.get('observations', [])) for n in self.memory.skeleton['nodes'] + self.memory.frontiers),
                                   dropped_observation_packets=self.dropped)
                     report = json.dumps(status)
                     if report != last_report:

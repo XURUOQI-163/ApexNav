@@ -71,6 +71,7 @@ public:
   void setNode(rclcpp::Node::SharedPtr node);
   void init();
   void clearVisualization();
+  SkeletonGraphManager* skeletonGraph() const { return skeleton_graph_.get(); }
 
 private:
   // ROS2 callback functions

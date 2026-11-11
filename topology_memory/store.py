@@ -16,6 +16,7 @@ import shutil
 import tempfile
 import threading
 import uuid
+from .keyframe_policy import junction_capture_allowed
 
 SCHEMA_VERSION = 1
 
@@ -75,11 +76,16 @@ def valid_id(value):
 
 
 class UnifiedTopologyMemory:
-    def __init__(self, directory, node_match_distance=.5, max_observations=8):
+    def __init__(self, directory, node_match_distance=.5, max_observations=8, *,
+                 save_frontier_images=False, max_junction_observations=4, max_deadend_observations=1):
         self.root = Path(directory).expanduser().resolve()
         self.node_match_distance = float(node_match_distance)
-        self.max_observations = int(max_observations)
-        if self.node_match_distance < 0 or self.max_observations < 1:
+        self.max_observations = int(max_observations)  # Frontier limit when explicitly enabled.
+        self.save_frontier_images = bool(save_frontier_images)
+        self.max_junction_observations = int(max_junction_observations)
+        self.max_deadend_observations = int(max_deadend_observations)
+        if self.node_match_distance < 0 or min(self.max_observations, self.max_junction_observations,
+                                             self.max_deadend_observations) < 1:
             raise ValueError('Invalid memory matching/observation limits')
         self.lock = threading.RLock()
         self.manifest = {}
@@ -87,9 +93,54 @@ class UnifiedTopologyMemory:
         self.frontiers = []
         self.attachments = []
         self._dirty = False
+        self._gc_needed = False
         self._node_sources = {}
         self._edge_sources = {}
         self.issues = []
+
+    def observation_limit(self, node):
+        if node['node_type'] == 'FRONTIER':
+            return self.max_observations if self.save_frontier_images else 0
+        if node['node_type'] == 'ENDPOINT':
+            return self.max_deadend_observations
+        if node['node_type'] == 'JUNCTION' and node.get('visit_state') != 'CONFIRMED':
+            return 0
+        return self.max_junction_observations  # Junction and rare loop anchors.
+
+    def _apply_node_policy(self, node):
+        old = node.get('observations', [])
+        changed = False
+        if node['node_type'] == 'JUNCTION':
+            if node.get('visit_state') not in ('CANDIDATE', 'CONFIRMED'):
+                node['visit_state'] = 'CANDIDATE'
+                changed = True
+            if not isinstance(node.get('visit_radius'), (int, float)) or not math.isfinite(node['visit_radius']) or node['visit_radius'] <= 0:
+                node['visit_radius'] = .5
+                changed = True
+            kept = [o for o in old if junction_capture_allowed(node, o.get('robot_pose'))][:self.observation_limit(node)]
+        else:
+            kept = old[:self.observation_limit(node)]
+            for key in ('visit_state', 'visit_radius', 'confirmed_at_ns', 'visit_position'):
+                if key in node:
+                    del node[key]
+                    changed = True
+        if node['node_type'] == 'FRONTIER':
+            # Per-cell fusion remains in FrontierManager; UTM stores its summary.
+            if 'cells' in node:
+                del node['cells']
+                changed = True
+            if not self.save_frontier_images:
+                if 'observations' in node:
+                    del node['observations']
+                    changed = True
+            else:
+                node['observations'] = kept
+        else:
+            node['observations'] = kept
+        if len(kept) != len(old):
+            self._gc_needed = True
+            changed = True
+        return changed
 
     def _document(self, **payload):
         return dict(schema_version=SCHEMA_VERSION, map_key=self.manifest.get('map_key'),
@@ -98,7 +149,8 @@ class UnifiedTopologyMemory:
     def begin_session(self, context):
         """Recover matching coordinates; archive a different scene/origin intact.
 
-        Persisted geometry is UNCONFIRMED in a new simulator run until matched.
+        Persisted geometry is UNCONFIRMED until the first valid full snapshot;
+        unmatched records are then discarded, not retained as retired history.
         Old Frontier task scores never become current simply because IDs repeat.
         """
         context = deepcopy(context)
@@ -119,6 +171,7 @@ class UnifiedTopologyMemory:
                         shutil.move(str(self.root / name), str(archive / name))
                 self.skeleton = dict(nodes=[], edges=[], map_info={})
                 self.frontiers, self.attachments = [], []
+            self._gc_needed |= bool(self.frontiers)
             self.frontiers, self.attachments = [], []
             for item in self.skeleton['nodes'] + self.skeleton['edges']:
                 item['status'] = 'UNCONFIRMED'
@@ -150,13 +203,10 @@ class UnifiedTopologyMemory:
                 node = dict(source, node_id=nid, layer='PERSISTENT', status='ACTIVE',
                             source_session=self.manifest['session_id'],
                             observations=deepcopy(old.get(nid, {}).get('observations', [])))
+                self._apply_node_policy(node)
                 current.append(node)
-            for nid, node in old.items():
-                if nid not in used:
-                    node = deepcopy(node)
-                    if node.get('source_session') == self.manifest['session_id']:
-                        node['status'] = 'RETIRED'
-                    current.append(node)
+            self._gc_needed |= bool(set(old) - used)
+            self._node_sources = {n['source_id']: n['node_id'] for n in current}
             previous_edges = {e['edge_id']: e for e in self.skeleton['edges']}
             edges, seen = [], set()
             for source in graph['edges']:
@@ -177,16 +227,17 @@ class UnifiedTopologyMemory:
                                   end_node_id=end, status='ACTIVE', source_session=self.manifest['session_id'],
                                   # Merged logical centres can differ from actual path endpoints.
                                   traversability='SKELETON_PATH_ONLY_REQUIRES_LOCAL_VALIDATION'))
-            for eid, edge in previous_edges.items():
-                if eid not in seen:
-                    edge = deepcopy(edge)
-                    if edge.get('source_session') == self.manifest['session_id']:
-                        edge['status'] = 'RETIRED'
-                    edges.append(edge)
+            self._edge_sources = {e['source_id']: e['edge_id'] for e in edges}
             result = dict(nodes=sorted(current, key=lambda n: n['node_id']),
                           edges=sorted(edges, key=lambda e: e['edge_id']), map_info=graph.get('map_info', {}))
             if result != self.skeleton:
                 self.skeleton = result
+                # Keep queries valid even before the next Frontier snapshot.
+                junctions = {n['node_id'] for n in current if n['node_type'] == 'JUNCTION'}
+                self.attachments = [e for e in self.attachments if e['start_node_id'] in junctions]
+                for node in self.frontiers:
+                    if node.get('parent_junction_id') not in junctions:
+                        node['parent_junction_id'] = None
                 self._dirty = True
 
     def save_frontier_state(self, frontiers):
@@ -196,6 +247,8 @@ class UnifiedTopologyMemory:
             active_junctions = {n['node_id'] for n in self.skeleton['nodes']
                                 if n['status'] == 'ACTIVE' and n['node_type'] == 'JUNCTION'}
             for source in sorted(frontiers, key=lambda n: n['source_id']):
+                if source.get('status') not in ('ACTIVE', 'DORMANT'):
+                    continue
                 source = deepcopy(source)
                 nid = 'F_' + self.manifest['session_id'] + '_' + str(source['source_id'])
                 parent = self._node_sources.get(source.pop('parent_source_id', None))
@@ -219,8 +272,10 @@ class UnifiedTopologyMemory:
                     attachments.append(dict(attachment, edge_id='A_' + nid, edge_type='FRONTIER_ATTACHMENT',
                                             start_node_id=parent, end_node_id=nid, status=node['status'],
                                             traversability='ATTACHMENT_ONLY_NOT_SKELETON_EDGE'))
+                self._apply_node_policy(node)
                 current.append(node)
             if current != self.frontiers or attachments != self.attachments:
+                self._gc_needed |= bool(set(previous) - {n['node_id'] for n in current})
                 self.frontiers, self.attachments = current, attachments
                 self._dirty = True
 
@@ -233,8 +288,13 @@ class UnifiedTopologyMemory:
             node = self._find_node(node_id)
             if node is None or not valid_id(node_id):
                 raise ValueError('Observation refers to a missing node')
+            limit = self.observation_limit(node)
+            if limit == 0:
+                return None
+            if node['node_type'] == 'JUNCTION' and not junction_capture_allowed(node, metadata.get('robot_pose')):
+                return None
             replacing = any(o['observation_id'] == replace_id for o in node['observations'])
-            if len(node['observations']) - int(replacing) >= self.max_observations:
+            if len(node['observations']) - int(replacing) >= limit:
                 return None
             if any(o['stamp_ns'] == metadata['stamp_ns'] for o in node['observations']):
                 return None
@@ -245,6 +305,7 @@ class UnifiedTopologyMemory:
             observation = dict(deepcopy(metadata), observation_id=oid, image_path=relative.as_posix(),
                                frame_id=self.manifest['frame_id'], session_id=self.manifest['session_id'])
             if replacing:
+                self._gc_needed = True
                 node['observations'] = [o for o in node['observations'] if o['observation_id'] != replace_id]
             node['observations'].append(observation)
             self._dirty = True
@@ -254,7 +315,7 @@ class UnifiedTopologyMemory:
         """Attach late inference to exactly the original stored frame, no JPEG rewrite."""
         with self.lock:
             node = self._find_node(node_id)
-            if not node or node['node_type'] != 'FRONTIER':
+            if not node or node['node_type'] != 'FRONTIER' or not self.save_frontier_images:
                 return False
             observation = next((o for o in node['observations'] if o['stamp_ns'] == stamp_ns), None)
             if observation is None:
@@ -271,7 +332,7 @@ class UnifiedTopologyMemory:
 
     def flush(self):
         with self.lock:
-            if not self._dirty or not self.manifest:
+            if not (self._dirty or self._gc_needed) or not self.manifest:
                 return
             for directory in ('persistent', 'dynamic', 'observations/junction', 'observations/frontier', 'snapshots'):
                 (self.root / directory).mkdir(parents=True, exist_ok=True)
@@ -284,7 +345,36 @@ class UnifiedTopologyMemory:
                         self._document(session_id=self.manifest['session_id'], nodes=self.frontiers, attachments=self.attachments))
             self.export_unified_graph()
             atomic_json(self.root / 'manifest.json', self.manifest)
+            # References must be durably published before old files are removed.
+            # On failure leave the flags set so the worker retries next cycle.
+            if self._gc_needed:
+                self._collect_orphan_images()
+            self._gc_needed = False
             self._dirty = False
+
+    def _collect_orphan_images(self):
+        """Only collect UTM-owned JPEGs in the current store, never archives.
+
+        Run on load, node removal or image replacement, not every camera frame.
+        Do not follow symlink directories into an unrelated location.
+        """
+        referenced = {o['image_path'] for n in self.skeleton['nodes'] + self.frontiers
+                      for o in n.get('observations', [])}
+        base = self.root / 'observations'
+        if base.is_symlink():
+            return
+        for kind in ('junction', 'frontier'):
+            directory = base / kind
+            if directory.is_symlink() or not directory.is_dir():
+                continue
+            for node_dir in directory.iterdir():
+                if node_dir.is_symlink() or not node_dir.is_dir() or not valid_id(node_dir.name):
+                    continue
+                for image in node_dir.glob('O_*.jpg'):
+                    if image.is_file() and image.relative_to(self.root).as_posix() not in referenced:
+                        image.unlink()
+                if not any(node_dir.iterdir()):
+                    node_dir.rmdir()
 
     def _read(self, relative):
         for suffix in ('', '.bak'):
@@ -327,6 +417,9 @@ class UnifiedTopologyMemory:
             def nodes(items, transient):
                 result = []
                 for node in items:
+                    valid_status = ('ACTIVE', 'DORMANT') if transient else ('ACTIVE', 'UNCONFIRMED')
+                    if node.get('status') not in valid_status:
+                        continue
                     nid = node.get('node_id')
                     try:
                         ok = valid_id(nid) and nid not in seen and math.isfinite(node['x']) and math.isfinite(node['y'])
@@ -348,6 +441,8 @@ class UnifiedTopologyMemory:
                         else:
                             self.issues.append(f'Missing or unsafe image for {nid}: {relative}')
                     node['observations'] = valid
+                    if self._apply_node_policy(node):
+                        self._dirty = True
                     result.append(node)
                 return result
 
@@ -360,6 +455,9 @@ class UnifiedTopologyMemory:
             def edges(items, attachment):
                 result = []
                 for edge in items:
+                    valid_status = ('ACTIVE', 'DORMANT') if attachment else ('ACTIVE', 'UNCONFIRMED')
+                    if edge.get('status') not in valid_status:
+                        continue
                     eid = edge.get('edge_id')
                     start, end = edge.get('start_node_id'), edge.get('end_node_id')
                     try:
@@ -390,7 +488,12 @@ class UnifiedTopologyMemory:
                                   if n.get('source_session') == manifest['session_id']}
             self._edge_sources = {e['source_id']: e['edge_id'] for e in self.skeleton['edges']
                                   if e.get('source_session') == manifest['session_id']}
-            self._dirty = removed_history_path
+            self._gc_needed = True  # Also remove orphan JPEGs left by older writers/crashes.
+            self._dirty = (self._dirty or removed_history_path or bool(self.issues) or
+                           len(self.skeleton['nodes']) != len(skel.get('nodes', [])) or
+                           len(self.skeleton['edges']) != len(skel.get('edges', [])) or
+                           len(self.frontiers) != len(dynamic.get('nodes', [])) or
+                           len(self.attachments) != len(dynamic.get('attachments', [])))
             return list(self.issues)
 
     def get_topology_graph(self, include_inactive=False):
@@ -414,7 +517,7 @@ class UnifiedTopologyMemory:
     def get_node_observations(self, node_id):
         with self.lock:
             node = self._find_node(node_id)
-            return deepcopy(node['observations']) if node else []
+            return deepcopy(node.get('observations', [])) if node else []
 
     def export_unified_graph(self):
         graph = self.get_topology_graph(include_inactive=True)

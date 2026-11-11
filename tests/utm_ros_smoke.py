@@ -38,6 +38,10 @@ def fixture(ns=200):
     graph.map_info.origin.orientation.w = 1.
     for node_id, x, y in ((1, 1.5, 1.5), (2, 1.5, 2.5)):
         node = SkeletonNode(node_id=node_id, node_type=1, active=True, position=Point(x=x, y=y))
+        node.visit_state=SkeletonNode.CONFIRMED
+        node.visit_radius=.5
+        node.confirmed_at_ns=ns
+        node.visit_position=Point(x=x,y=y)
         graph.nodes.append(node)
     edge = SkeletonEdge(edge_id=1, start_node_id=1, end_node_id=2, length=1., min_clearance=.5)
     edge.path = [n.position for n in graph.nodes]
@@ -65,6 +69,8 @@ def fixture(ns=200):
     odom = Odometry()
     header(odom, ns)
     odom.pose.pose.orientation.w = 1.
+    odom.pose.pose.position.x=1.4
+    odom.pose.pose.position.y=1.5
     observation = TopologyObservation(image=rgb, camera_pose=scan.camera_pose, robot_pose=odom.pose.pose,
                                       camera_yaw=0., goal_text='chair', model_name='blip2',
                                       raw_similarity=.23, computed_at_ns=ns+5, cell_ids=[12], weights=[.5])
@@ -73,9 +79,57 @@ def fixture(ns=200):
 
 
 class RecorderCheck(unittest.TestCase):
-    def test_original_frame_late_score_and_restart(self):
+    def test_candidate_remote_frames_and_nearby_replacement(self):
+        from copy import deepcopy
+        with tempfile.TemporaryDirectory() as temp:
+            memory=UnifiedTopologyMemory(temp);recorder=MemoryRecorder(memory,CvBridge())
+            context,graph,state,frame,_=fixture()
+            graph.nodes[0].visit_state=SkeletonNode.CANDIDATE
+            recorder.process(context,graph,state,[frame],[])
+            node=next(n for n in memory.skeleton['nodes'] if n['source_id']==1)
+            self.assertEqual(node['visit_state'],'CANDIDATE')
+            self.assertEqual(node['observations'],[])
+            graph.nodes[0].visit_state=SkeletonNode.CONFIRMED
+            recorder.process(context,graph,state,[],[])
+            node=next(n for n in memory.skeleton['nodes'] if n['source_id']==1)
+            self.assertEqual(len(node['observations']),1)
+            old_path=Path(temp)/node['observations'][0]['image_path']
+            closer=deepcopy(frame)
+            for msg in closer:header(msg,201)
+            closer[2].pose.pose.position.x=1.5
+            recorder.process(context,graph,state,[closer],[])
+            node=next(n for n in memory.skeleton['nodes'] if n['source_id']==1)
+            self.assertEqual(len(node['observations']),1)
+            self.assertEqual(node['observations'][0]['stamp_ns'],201)
+            self.assertFalse(old_path.exists())
+            remote=deepcopy(frame)
+            for msg in remote:header(msg,202)
+            remote[2].pose.pose.position.x=0.
+            recorder.process(context,graph,state,[remote],[])
+            node=next(n for n in memory.skeleton['nodes'] if n['source_id']==1)
+            self.assertEqual(len(node['observations']),1)
+            self.assertEqual(node['observations'][0]['stamp_ns'],201)
+
+    def test_frontier_images_off_preserves_semantics_and_junction_images(self):
         with tempfile.TemporaryDirectory() as temp:
             memory = UnifiedTopologyMemory(temp)
+            recorder = MemoryRecorder(memory, CvBridge())
+            context, graph, state, frame, scored = fixture()
+            self.assertTrue(recorder.process(context, graph, state, [frame], [scored]))
+            frontier = memory.get_active_frontiers()[0]
+            self.assertNotIn('cells', frontier)
+            self.assertNotIn('observations', frontier)
+            self.assertAlmostEqual(frontier['semantic']['fused_score'], .21)
+            self.assertAlmostEqual(frontier['semantic']['raw_similarity'], .23)
+            self.assertEqual(frontier['semantic']['computed_at'], 205)
+            self.assertEqual(len(memory.attachments), 1)
+            self.assertFalse(list((Path(temp) / 'observations/frontier').rglob('*.jpg')))
+            self.assertTrue(list((Path(temp) / 'observations/junction').rglob('*.jpg')))
+            self.assertFalse(hasattr(recorder.scored[200], 'image'))
+
+    def test_original_frame_late_score_and_restart(self):
+        with tempfile.TemporaryDirectory() as temp:
+            memory = UnifiedTopologyMemory(temp, save_frontier_images=True)
             recorder = MemoryRecorder(memory, CvBridge())
             context, graph, state, frame, scored = fixture()
             self.assertTrue(recorder.process(context, graph, state, [frame], []))
@@ -92,13 +146,13 @@ class RecorderCheck(unittest.TestCase):
             image = cv2.imread(str(Path(temp) / observation['image_path']))
             self.assertGreater(int(image[0, 0, 2]), 240)
             self.assertLess(int(image[0, 0, 0]), 10)
-            restored = UnifiedTopologyMemory(temp)
+            restored = UnifiedTopologyMemory(temp, save_frontier_images=True)
             self.assertEqual(restored.load_memory(), [])
             self.assertEqual(len(restored.get_topology_graph()['edges']), 2)
 
     def test_pre_session_snapshot_and_wrong_goal_are_rejected(self):
         with tempfile.TemporaryDirectory() as temp:
-            memory = UnifiedTopologyMemory(temp)
+            memory = UnifiedTopologyMemory(temp, save_frontier_images=True)
             recorder = MemoryRecorder(memory, CvBridge())
             context, graph, state, frame, scored = fixture()
             graph.header.stamp.nanosec = 90
@@ -113,7 +167,7 @@ class RecorderCheck(unittest.TestCase):
     def test_incremental_scored_packets_merge_and_upgrade_nearby_view(self):
         from copy import deepcopy
         with tempfile.TemporaryDirectory() as temp:
-            memory = UnifiedTopologyMemory(temp)
+            memory = UnifiedTopologyMemory(temp, save_frontier_images=True)
             recorder = MemoryRecorder(memory, CvBridge())
             context, graph, state, frame, scored = fixture()
             cell = deepcopy(state.nodes[0].cells[0])

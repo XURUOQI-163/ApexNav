@@ -1,0 +1,4 @@
+/**:
+  ros__parameters:
+    skeleton_route:
+      connection_radius: 2.0  # m; start connects only to visible, currently free nearby graph geometry

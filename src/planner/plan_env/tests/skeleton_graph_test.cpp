@@ -45,7 +45,7 @@ void validate(const GridInput& in, const Graph& g) {
 }
 Graph extract(const GridInput& in, Options opts={}) { auto g=build(in,opts);validate(in,g);return g; }
 int main() {
-  Options opts; opts.min_branch_length=0;opts.min_deadend_width=0;
+  Options opts; opts.min_branch_length=0;opts.min_deadend_width=0;opts.junction_merge_length=0;
   auto straight=blank();line(straight,{10,40},{70,40},7);
   auto before=straight.cells.clone();auto g=extract(straight,opts);
   check(count(g,NodeType::ENDPOINT)==2&&g.edges.size()==1&&g.nodes.size()==2,"straight: expected E2/J0/edge1");
@@ -115,37 +115,14 @@ int main() {
   check(extract(straight,width_prune).nodes.size()==2,"long wide isolated corridor must survive");
   check(extract(slit,width_prune).nodes.size()==2,"branch pruning must not consume the wide remaining corridor");
   std::cout<<"PASS isolated short/narrow components removed, wide corridor retained\n";
-  // These tests disable length/width pruning, isolating actual-frontier distance.
+  // A real frontier at the end of a long branch must not erase its junction.
   auto facing=t;facing.cells=t.cells.clone();facing.cells.at<uint8_t>(9,40)=UNKNOWN;
-  check(extract(facing,opts).nodes.size()==4,"generic Unknown proximity must not prune without a real frontier");
-  facing.frontier_cells={{40,9}};
   auto facing_before=facing.cells.clone();auto facing_graph=extract(facing,opts);
-  check(facing_graph.nodes.size()==2&&facing_graph.edges.size()==1&&facing_graph.pruned_branches==1,
-        "reachable actual frontier must prune terminal branch even if long");
-  check(cv::countNonZero(facing_before!=facing.cells)==0,"frontier pruning modified occupancy");
-  auto disabled=opts;disabled.frontier_deadend_distance=0;
-  check(extract(facing,disabled).nodes.size()==4,"frontier pruning switch ignored");
-  auto exact=opts;exact.frontier_deadend_distance=.05;
-  check(extract(facing,exact).nodes.size()==4,"distance equal to threshold must not prune");
-  exact.frontier_deadend_distance=.0501;
-  check(extract(facing,exact).nodes.size()==2,"half-cell distance to shared frontier face not used");
-  // A nearby frontier across a wall requires a detour longer than 0.2m.
-  auto wall=t;wall.cells=t.cells.clone();wall.geometry.resolution=.05;
-  wall.cells.at<uint8_t>(10,42)=UNKNOWN;wall.frontier_cells={{42,10}};
-  line(wall,{42,11},{42,20});line(wall,{40,20},{42,20});
-  auto wall_graph=extract(wall,opts);
-  bool kept=false;for(const auto& n:wall_graph.nodes)kept|=n.pixel==cv::Point(40,10);
-  check(kept,"nearby frontier across wall must use long free-space detour");
-  auto corner_block=t;corner_block.cells=t.cells.clone();corner_block.geometry.resolution=.05;
-  corner_block.cells.at<uint8_t>(9,39)=UNKNOWN;corner_block.frontier_cells={{39,9}};
-  corner_block.cells.at<uint8_t>(9,38)=FREE; // Actual frontier has a free neighbour on its far side.
-  check(extract(corner_block,opts).nodes.size()==4,"diagonal Unknown proximity must not cut blocked corners");
-  auto stale=facing;stale.cells=facing.cells.clone();stale.cells.at<uint8_t>(9,40)=BLOCKED;
-  check(extract(stale,opts).nodes.size()==4,"obsolete frontier cell now occupied must be ignored");
-  auto no_frontiers=facing;no_frontiers.frontier_cells.clear();
-  auto recovered=build(no_frontiers,opts,facing_graph);validate(no_frontiers,recovered);
-  check(recovered.nodes.size()==4,"frontier removal must allow geometry reconstruction from unchanged occupancy");
-  std::cout<<"PASS actual frontier boundary pruning, strict threshold, walls, corner blocking, stale cells and recovery\n";
+  check(count(facing_graph,NodeType::ENDPOINT)==3&&count(facing_graph,NodeType::JUNCTION)==1&&
+        facing_graph.edges.size()==3&&facing_graph.pruned_branches==0,
+        "frontier-adjacent branch and junction must survive");
+  check(cv::countNonZero(facing_before!=facing.cells)==0,"extraction modified occupancy");
+  std::cout<<"PASS frontier-adjacent branch retains its endpoint and junction\n";
   auto islands=blank();line(islands,{5,15},{70,15},7);line(islands,{30,55},{50,55});
   auto island_filter=opts;island_filter.min_island_area=1.;
   auto input_before=islands.cells.clone();auto cleaned=extract(islands,island_filter);
@@ -280,4 +257,50 @@ int main() {
  check(count(disconnected,NodeType::JUNCTION)==2&&disconnected.nodes.size()==8&&disconnected.edges.size()==6,
        "disconnected T junctions must remain separate, without a blocked midpoint");
  std::cout<<"PASS disconnected junctions retain their real geometry\n";
+ // Merge by original direct edge length, not by Euclidean proximity.
+ auto merge=opts;merge.junction_merge_length=.5;
+ auto merged=build(nearby,merge);
+ check(count(merged,NodeType::JUNCTION)==1&&merged.edges.size()==4,"short connected junctions must merge");
+ for(const auto& n:merged.nodes)if(n.type==NodeType::JUNCTION)
+   check(cv::norm(n.position-nearby.geometry.world({32,40}))<1e-9&&n.neighbor_count==4,"junction arithmetic mean / external branches");
+ for(const auto& e:merged.edges) {
+   double length=0;for(size_t i=1;i<e.path.size();++i)length+=cv::norm(e.path[i]-e.path[i-1]);
+   check(std::abs(length-e.length)<1e-9&&e.path==e.display_path,"merged edge metric geometry");
+   for(const auto& n:merged.nodes){
+     if(n.id==e.start)check(cv::norm(e.path.front()-n.position)<1e-9,"merged edge start");
+     if(n.id==e.end)check(cv::norm(e.path.back()-n.position)<1e-9,"merged edge end");
+   }
+ }
+ merge.junction_merge_length=.4;
+ check(count(build(nearby,merge),NodeType::JUNCTION)==2,"threshold must be strictly less than");
+ merge.junction_merge_length=.5;
+ auto chain=nearby;chain.cells=nearby.cells.clone();line(chain,{38,10},{38,40});
+ auto chained=build(chain,merge);
+ check(count(chained,NodeType::JUNCTION)==1,"short-edge clustering must be transitive");
+ for(const auto& n:chained.nodes)if(n.type==NodeType::JUNCTION)
+   check(cv::norm(n.position-chain.geometry.world({34,40}))<1e-9,"mean must weight original nodes equally");
+ merge.junction_merge_length=10.;
+ check(count(build(separated,merge),NodeType::JUNCTION)==2,"disconnected junctions must never merge");
+ merge.junction_merge_length=.5;
+ auto mean_repeat=build(nearby,merge,merged);
+ for(size_t i=0;i<merged.nodes.size();++i)check(merged.nodes[i].id==mean_repeat.nodes[i].id,"merged repeat IDs");
+ std::cout<<"PASS short-edge Junction clustering, mean, strict threshold, transitive groups and disconnected components\n";
+ auto visits=tg;
+ auto junction_it=std::find_if(visits.nodes.begin(),visits.nodes.end(),[](const Node& n){return n.type==NodeType::JUNCTION;});
+ auto junction_pos=junction_it->position;auto junction_id=junction_it->id;
+ check(junction_it->visit_state==VisitState::CANDIDATE,"unvisited Junction must start candidate");
+ check(!confirmVisitedJunctions(visits,junction_pos+cv::Point2d(.51,0),.5,100),"outside radius confirmed");
+ check(confirmVisitedJunctions(visits,junction_pos+cv::Point2d(.49,0),.5,101),"actual visit did not confirm");
+ check(junction_it->visit_state==VisitState::CONFIRMED&&junction_it->confirmed_at_ns==101,"visit evidence missing");
+ auto visited_rebuild=build(t,opts,visits);
+ for(const auto& n:visited_rebuild.nodes)if(n.id==junction_id)
+   check(n.visit_state==VisitState::CONFIRMED,"rebuild lost confirmed state");
+ auto delayed=tg;inheritJunctionVisits(delayed,visits,.5);
+ for(const auto& n:delayed.nodes)if(n.id==junction_id)check(n.visit_state==VisitState::CONFIRMED,"async result undid newer visit");
+ for(auto& n:delayed.nodes)if(n.id==junction_id)n.position+=cv::Point2d(-1,0);
+ inheritJunctionVisits(delayed,visits,.5);
+ for(const auto& n:delayed.nodes)if(n.id==junction_id)check(n.visit_state==VisitState::CANDIDATE,"moved node borrowed invalid visit");
+ for(const auto& n:visits.nodes)if(n.type==NodeType::ENDPOINT)
+   check(n.confirmed_at_ns==0,"Endpoint must not acquire a visit state");
+ std::cout<<"PASS visit radius, actual witness, rebuild and asynchronous state inheritance\n";
 }

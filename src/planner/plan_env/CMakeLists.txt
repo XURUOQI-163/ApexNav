@@ -66,6 +66,7 @@ add_library(plan_env_lib SHARED
   src/value_map2d.cpp
   src/topology_graph.cpp
   src/sparse_topology_observer.cpp
+  src/skeleton_route.cpp
   src/skeleton_graph.cpp
   src/skeleton_frontier_links.cpp
   src/skeleton_graph_manager.cpp
@@ -155,6 +156,9 @@ if(BUILD_TESTING)
   add_executable(skeleton_frontier_links_test tests/skeleton_frontier_links_test.cpp src/skeleton_graph.cpp src/skeleton_frontier_links.cpp)
   target_link_libraries(skeleton_frontier_links_test ${OpenCV_LIBRARIES})
   add_test(NAME skeleton_frontier_links COMMAND skeleton_frontier_links_test)
+  add_executable(skeleton_route_test tests/skeleton_route_test.cpp src/skeleton_route.cpp src/skeleton_frontier_links.cpp src/skeleton_graph.cpp)
+  target_link_libraries(skeleton_route_test ${OpenCV_LIBRARIES})
+  add_test(NAME skeleton_route COMMAND skeleton_route_test)
   add_executable(skeleton_manager_test tests/skeleton_manager_test.cpp)
   target_link_libraries(skeleton_manager_test plan_env_lib)
   add_test(NAME skeleton_manager COMMAND skeleton_manager_test)

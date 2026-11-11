@@ -76,6 +76,9 @@ public:
 
   void initialize(rclcpp::Node::SharedPtr node);
 
+  void applySelectedSkeletonPath(const Vector2d& start);
+  bool restoreSelectedGridPath();
+  const vector<Vector2d>& selectedGridPath() const;
   int planNextBestPoint(const Vector3d& pos, const double& yaw);
   bool planTrajectory(const Eigen::VectorXd& start, const Eigen::VectorXd& end, const Vector3d& ctrl);
   void getSortedSemanticFrontiers(const Vector2d& cur_pos, const vector<Vector2d>& frontiers,
@@ -96,6 +99,9 @@ public:
 
 private:
   rclcpp::Node::SharedPtr node_;
+  bool skeleton_route_enabled_=false,using_skeleton_route_=false;
+  double skeleton_connection_radius_=2.0;
+  vector<Vector2d> grid_fallback_path_;
 
   // Exploration Policy
   void chooseExplorationPolicy(Vector2d cur_pos, vector<Vector2d> frontiers,

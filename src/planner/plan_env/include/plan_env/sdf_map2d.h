@@ -36,6 +36,7 @@ class ObjectMap2D;
 class ValueMap;
 class FrontierMap2D;
 class MapROS;
+class SkeletonGraphManager;
 namespace topology { class RollingLocalMap; }
 
 class SDFMap2D {
@@ -65,6 +66,7 @@ public:
   // Map query functions
   bool isInMap(const Eigen::Vector2d& pos);
   bool isInMap(const Eigen::Vector2i& idx);
+  SkeletonGraphManager* skeletonGraph() const;
   int getOccupancy(const Eigen::Vector2d& pos);
   int getOccupancy(const Eigen::Vector2i& id);
   double getDistance(const Eigen::Vector2d& pos);

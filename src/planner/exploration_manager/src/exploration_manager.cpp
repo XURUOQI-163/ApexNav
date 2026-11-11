@@ -26,6 +26,22 @@ void ExplorationManager::initialize(rclcpp::Node::SharedPtr node)
 {
   node_ = node;
 
+  if(!node_->has_parameter("global_path_planner"))node_->declare_parameter("global_path_planner",std::string("GRID"));
+  const auto global_path=node_->get_parameter("global_path_planner").as_string();
+  if(global_path!="GRID"&&global_path!="SKELETON")throw std::invalid_argument("global_path_planner must be GRID or SKELETON");
+  skeleton_route_enabled_=global_path=="SKELETON";
+  if(!node_->has_parameter("skeleton_route.connection_radius"))node_->declare_parameter("skeleton_route.connection_radius",2.0);
+  skeleton_connection_radius_=node_->get_parameter("skeleton_route.connection_radius").as_double();
+  if(!std::isfinite(skeleton_connection_radius_)||skeleton_connection_radius_<=0)
+    throw std::invalid_argument("skeleton_route.connection_radius must be positive");
+  if(skeleton_route_enabled_) {
+    if(!node_->has_parameter("skeleton_graph.enabled"))node_->declare_parameter("skeleton_graph.enabled",true);
+    node_->set_parameter(rclcpp::Parameter("skeleton_graph.enabled",true));
+    if(!node_->has_parameter("skeleton_graph.connect_frontiers"))node_->declare_parameter("skeleton_graph.connect_frontiers",true);
+    node_->set_parameter(rclcpp::Parameter("skeleton_graph.connect_frontiers",true));
+  }
+  RCLCPP_INFO(node_->get_logger(),"[GlobalPath] %s; Frontier scoring and selection unchanged",global_path.c_str());
+
   // Initialize SDF map and get object map reference
   sdf_map_.reset(new SDFMap2D);
   sdf_map_->initMap(node_);
@@ -90,6 +106,8 @@ int ExplorationManager::planNextBestPoint(const Vector3d& pos, const double& yaw
   Vector2d pos2d = Vector2d(pos(0), pos(1));
   auto t1 = node_->get_clock()->now();
   auto t2 = t1;
+
+  grid_fallback_path_.clear();using_skeleton_route_=false;
 
   // Clear previous planning results
   ed_->tsp_tour_.clear();
@@ -196,6 +214,37 @@ int ExplorationManager::planNextBestPoint(const Vector3d& pos, const double& yaw
   }
 
   return EXPLORATION;
+}
+
+const vector<Vector2d>& ExplorationManager::selectedGridPath() const {
+  return grid_fallback_path_.empty()?ed_->next_best_path_:grid_fallback_path_;
+}
+
+void ExplorationManager::applySelectedSkeletonPath(const Vector2d& start)
+{
+  using_skeleton_route_=false;grid_fallback_path_=ed_->next_best_path_;
+  if(!skeleton_route_enabled_||grid_fallback_path_.empty())return;
+  auto manager=sdf_map_->skeletonGraph();
+  skeleton::Route route;
+  if(manager)route=manager->routeToFrontier({start.x(),start.y()},{ed_->next_pos_.x(),ed_->next_pos_.y()},skeleton_connection_radius_);
+  else route.reason="GRAPH_DISABLED";
+  if(route.reason.empty()&&route.path.size()<2)route.reason="NO_ADVANCE_ON_SKELETON";
+  if(!route.reason.empty()) {
+    RCLCPP_INFO(node_->get_logger(),"[GlobalPath] GRID fallback: %s; selected target unchanged",route.reason.c_str());
+    return;
+  }
+  ed_->next_best_path_.clear();
+  for(auto p:route.path)ed_->next_best_path_.emplace_back(p.x,p.y);
+  using_skeleton_route_=true;
+  RCLCPP_INFO(node_->get_logger(),"[GlobalPath] SKELETON: edges=%zu length=%.2fm points=%zu",route.edge_ids.size(),route.length,route.path.size());
+}
+
+bool ExplorationManager::restoreSelectedGridPath()
+{
+  if(!using_skeleton_route_||grid_fallback_path_.empty())return false;
+  ed_->next_best_path_=grid_fallback_path_;using_skeleton_route_=false;
+  RCLCPP_WARN(node_->get_logger(),"[GlobalPath] GRID fallback: local trajectory failed; selected target unchanged");
+  return true;
 }
 
 void ExplorationManager::chooseExplorationPolicy(Vector2d cur_pos, vector<Vector2d> frontiers,

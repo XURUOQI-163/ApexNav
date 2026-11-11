@@ -297,6 +297,9 @@ TrajPlannerResult ExplorationFSMReal::callTrajectoryPlanner()
     return TrajPlannerResult::MISSION_COMPLETE;
   }
 
+  if(expl_res == EXPL_RESULT::EXPLORATION)
+    expl_manager_->applySelectedSkeletonPath(fd_->start_pt_.head(2));
+
   // Select local target from global path
   Eigen::Vector2d goal_pos = expl_manager_->ed_->next_pos_;
   double goal_yaw = 0.0;
@@ -319,6 +322,12 @@ TrajPlannerResult ExplorationFSMReal::callTrajectoryPlanner()
 
   // Plan trajectory using GCopter
   bool traj_res = expl_manager_->planTrajectory(current_state, goal_state, current_control);
+  if(!traj_res && expl_manager_->restoreSelectedGridPath()) {
+    goal_pos=expl_manager_->ed_->next_pos_;goal_yaw=0.0;
+    selectLocalTarget(fd_->start_pt_.head(2),expl_manager_->ed_->next_best_path_,4.0,goal_pos,goal_yaw);
+    goal_state << goal_pos(0),goal_pos(1),goal_yaw,0.0,0.0;
+    traj_res=expl_manager_->planTrajectory(current_state,goal_state,current_control);
+  }
   if (traj_res) {
     auto info = &expl_manager_->gcopter_->local_trajectory_;
     info->start_time = (node_->get_clock()->now() - time_r).seconds() > 0 ?

@@ -33,6 +33,8 @@ def select_planner(context):
                            cwd=str(root), output='screen', sigterm_timeout='15'),
         ]
     if planner == 'TOPOLOGY':
+        if LaunchConfiguration('global_path').perform(context) != 'GRID':
+            raise ValueError('global_path:=SKELETON requires planner:=APEXNAV')
         if LaunchConfiguration('skeleton').perform(context).lower() == 'true':
             raise ValueError('Skeleton Graph observes the global APEXNAV map; use planner:=APEXNAV')
         if mode != 'continuous':
@@ -61,6 +63,8 @@ def generate_launch_description():
     return LaunchDescription([
         DeclareLaunchArgument('planner', default_value='APEXNAV', choices=['APEXNAV', 'TOPOLOGY'],
                               description='Grid-based ApexNav or geometric topology with rolling local map'),
+        DeclareLaunchArgument('global_path', default_value='GRID', choices=['GRID', 'SKELETON'],
+                              description='APEXNAV selected-target routing: grid or skeleton Dijkstra with grid fallback'),
         DeclareLaunchArgument('mode', default_value='discrete', choices=['discrete', 'continuous'],
                               description='Must match habitat_evaluation.py --mode'),
         DeclareLaunchArgument('topology', default_value='none', choices=['none', 'sparse'],

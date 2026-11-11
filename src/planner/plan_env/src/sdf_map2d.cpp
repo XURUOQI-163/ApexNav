@@ -19,6 +19,10 @@
 #include <unordered_map>
 
 namespace apexnav_planner {
+SkeletonGraphManager* SDFMap2D::skeletonGraph() const {
+  return map_ros_?map_ros_->skeletonGraph():nullptr;
+}
+
 SDFMap2D::SDFMap2D() = default;
 SDFMap2D::~SDFMap2D() = default;
 

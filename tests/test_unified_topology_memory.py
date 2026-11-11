@@ -19,8 +19,8 @@ def context(session='run1', goal='chair', origin=0):
 
 
 def skeleton():
-    return dict(nodes=[dict(source_id=1, node_type='JUNCTION', x=0., y=0.),
-                       dict(source_id=2, node_type='JUNCTION', x=2., y=0.)],
+    return dict(nodes=[dict(source_id=1, node_type='JUNCTION', x=0., y=0., visit_state='CONFIRMED', visit_radius=.5),
+                       dict(source_id=2, node_type='JUNCTION', x=2., y=0., visit_state='CONFIRMED', visit_radius=.5)],
                 edges=[dict(source_id=1, start_source_id=1, end_source_id=2,
                             path=[[0., 0.], [1., .2], [2., 0.]], length=2.04,
                             min_clearance=.3, mean_clearance=None)], map_info={})
@@ -39,13 +39,151 @@ class MemoryTest(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name) / 'topology'
-        self.m = UnifiedTopologyMemory(self.root)
+        self.m = UnifiedTopologyMemory(self.root, save_frontier_images=True)
         self.m.begin_session(context())
         self.m.save_skeleton_graph(skeleton())
         self.m.save_frontier_state(frontiers())
 
     def tearDown(self):
         self.temp.cleanup()
+
+    def _image(self, node_id, stamp=200, replace_id=None):
+        node=self.m._find_node(node_id)
+        return self.m.save_observation(node_id, b'encoded test image',
+            dict(stamp_ns=stamp, camera_pose=[0, 0, .88, 0, 0, 0, 1],
+                 robot_pose=[node['x'], node['y'], 0, 0, 0, 0, 1], camera_yaw=0.), replace_id=replace_id)
+
+    def test_disappeared_nodes_edges_and_images_are_removed_after_flush(self):
+        junction = self.m._node_sources[1]
+        frontier = self.m.frontiers[0]['node_id']
+        images = [self._image(junction), self._image(frontier)]
+        self.m.flush()
+        remaining = skeleton()
+        remaining['nodes'] = remaining['nodes'][1:]
+        remaining['edges'] = []
+        self.m.save_skeleton_graph(remaining)
+        self.m.save_frontier_state([])
+        self.assertEqual(len(self.m.skeleton['nodes']), 1)
+        self.assertEqual(self.m.skeleton['edges'], [])
+        self.assertEqual(set(self.m._node_sources), {2})
+        self.assertEqual(self.m._edge_sources, {})
+        self.assertEqual(self.m.get_node_observations(junction), [])
+        self.assertTrue(all((self.root / o['image_path']).exists() for o in images))
+        self.m.flush()
+        self.assertTrue(all(not (self.root / o['image_path']).exists() for o in images))
+        other = UnifiedTopologyMemory(self.root)
+        other.load_memory()
+        self.assertEqual(len(other.skeleton['nodes']), 1)
+        self.assertEqual(other.frontiers, [])
+
+    def test_candidate_and_capture_distance_gate_and_legacy_cleanup(self):
+        source=skeleton();source['nodes'][0]['visit_state']='CANDIDATE'
+        self.m.save_skeleton_graph(source)
+        nid=self.m._node_sources[1]
+        self.assertIsNone(self._image(nid))
+        source['nodes'][0]['visit_state']='CONFIRMED'
+        self.m.save_skeleton_graph(source)
+        self.assertIsNotNone(self._image(nid))
+        self.assertIsNone(self.m.save_observation(nid,b'image',dict(stamp_ns=201,robot_pose=[.6,0.])))
+        self.m.flush()
+        restored=UnifiedTopologyMemory(self.root);restored.load_memory()
+        self.assertEqual(restored._find_node(nid)['visit_state'],'CONFIRMED')
+        # Legacy remote-observation pictures are not proof of an actual visit.
+        path=self.root/'persistent/skeleton_graph.json';data=json.loads(path.read_text())
+        for node in data['nodes']:node.pop('visit_state',None)
+        path.write_text(json.dumps(data))
+        restored=UnifiedTopologyMemory(self.root);restored.load_memory();restored.flush()
+        self.assertEqual(restored._find_node(nid)['visit_state'],'CANDIDATE')
+        self.assertEqual(restored.get_node_observations(nid),[])
+
+    def test_dormant_frontier_images_remain_valid(self):
+        node = self.m.frontiers[0]['node_id']
+        image = self._image(node)
+        data = frontiers(); data[0]['status'] = 'DORMANT'
+        self.m.save_frontier_state(data); self.m.flush()
+        self.assertEqual(len(self.m.frontiers), 1)
+        self.assertTrue((self.root / image['image_path']).exists())
+
+    def test_observation_replacement_collects_old_jpeg_only_after_successful_flush(self):
+        from unittest.mock import patch
+        from topology_memory import store
+        node = self.m.frontiers[0]['node_id']
+        old = self._image(node); self.m.flush()
+        new = self._image(node, 201, old['observation_id'])
+        with patch.object(store, 'atomic_json', side_effect=OSError('disk unavailable')):
+            with self.assertRaises(OSError): self.m.flush()
+        self.assertTrue((self.root / old['image_path']).exists())
+        self.m.flush()
+        self.assertFalse((self.root / old['image_path']).exists())
+        self.assertTrue((self.root / new['image_path']).exists())
+
+    def test_load_discards_retired_records_and_collects_orphans_without_touching_archives(self):
+        retired = self.m._node_sources[1]
+        image = self._image(retired); self.m.flush()
+        path = self.root / 'persistent/skeleton_graph.json'
+        data = json.loads(path.read_text())
+        for node in data['nodes']:
+            if node['node_id'] == retired: node['status'] = 'RETIRED'
+        path.write_text(json.dumps(data))
+        orphan = self.root / 'observations/frontier/F_old/O_orphan.jpg'
+        orphan.parent.mkdir(parents=True); orphan.write_bytes(b'orphan')
+        archive = self.root / 'archives/previous/observations/image.jpg'
+        archive.parent.mkdir(parents=True); archive.write_bytes(b'archive')
+        other = UnifiedTopologyMemory(self.root); other.load_memory()
+        self.assertEqual(len(other.skeleton['nodes']), 1)
+        self.assertEqual(other.skeleton['edges'], [])
+        other.flush()
+        self.assertFalse((self.root / image['image_path']).exists())
+        self.assertFalse(orphan.exists())
+        self.assertTrue(archive.exists())
+
+    def test_new_session_matches_visible_nodes_then_drops_unconfirmed_history(self):
+        kept = self.m._node_sources[1]
+        discarded = self.m._node_sources[2]
+        image = self._image(discarded); self.m.flush()
+        self.m.begin_session(context('run2'))
+        current = skeleton(); current['nodes'] = current['nodes'][:1]; current['edges'] = []
+        self.m.save_skeleton_graph(current); self.m.flush()
+        self.assertEqual([n['node_id'] for n in self.m.skeleton['nodes']], [kept])
+        self.assertFalse((self.root / image['image_path']).exists())
+
+    def test_default_policy_disables_frontier_jpeg_and_compacts_state(self):
+        memory = UnifiedTopologyMemory(self.root / 'default')
+        memory.begin_session(context()); memory.save_skeleton_graph(skeleton())
+        memory.save_frontier_state(frontiers())
+        node = memory.frontiers[0]
+        self.assertNotIn('cells', node)
+        self.assertNotIn('observations', node)
+        self.assertEqual(node['semantic']['fused_score'], .21)
+        self.assertIsNone(memory.save_observation(node['node_id'], b'image', dict(stamp_ns=1)))
+        memory.flush()
+        self.assertFalse(list((memory.root / 'observations/frontier').rglob('*.jpg')))
+        saved = json.loads((memory.root / 'dynamic/frontier_state.json').read_text())
+        self.assertNotIn('cells', saved['nodes'][0])
+        self.assertNotIn('observations', saved['nodes'][0])
+        self.assertEqual(len(saved['attachments']), 1)
+
+    def test_type_specific_limits_and_existing_image_cleanup(self):
+        data = skeleton(); data['nodes'][1]['node_type'] = 'ENDPOINT'
+        self.m.save_skeleton_graph(data)
+        junction, endpoint = self.m._node_sources[1], self.m._node_sources[2]
+        for i in range(6):
+            self._image(junction, 200 + i)
+            self._image(endpoint, 200 + i)
+        self.assertEqual(len(self.m.get_node_observations(junction)), 4)
+        self.assertEqual(len(self.m.get_node_observations(endpoint)), 1)
+        # Simulate legacy records written with a larger cap, then migrate on load.
+        self.m.max_junction_observations = self.m.max_deadend_observations = 8
+        for i in range(3):
+            self._image(junction, 300 + i); self._image(endpoint, 300 + i)
+        frontier = self.m.frontiers[0]['node_id']; old = self._image(frontier)
+        self.m.flush()
+        other = UnifiedTopologyMemory(self.root)
+        other.load_memory(); other.flush()
+        self.assertNotIn('observations', other.frontiers[0])
+        self.assertFalse((self.root / old['image_path']).exists())
+        self.assertEqual(len(other.get_node_observations(junction)), 4)
+        self.assertEqual(len(other.get_node_observations(endpoint)), 1)
 
     def test_atomic_files_remain_host_readable_after_replacement_and_backup(self):
         from topology_memory.store import atomic_bytes, atomic_json
@@ -207,6 +345,24 @@ class MemoryTest(unittest.TestCase):
         recovered = UnifiedTopologyMemory(self.root)
         recovered.load_memory()
         self.assertEqual(recovered.manifest['scene_id'], 'scene.glb')
+
+
+class KeyframePolicyTest(unittest.TestCase):
+    def test_distinct_view_uses_angle_or_distance_against_every_saved_frame(self):
+        from topology_memory.recorder import MemoryRecorder
+        import math
+        memory = NS(max_observations=8)
+        memory.observation_limit = lambda node: memory.max_observations
+        recorder = MemoryRecorder(memory, None)
+        node = dict(observations=[dict(stamp_ns=1, camera_pose=[0., 0.], camera_yaw=0.)])
+        self.assertFalse(recorder._distinct(node, 1, [2., 0.], math.pi))
+        self.assertFalse(recorder._distinct(node, 2, [.1, 0.], .1))
+        self.assertTrue(recorder._distinct(node, 2, [.75, 0.], 0.))
+        self.assertTrue(recorder._distinct(node, 2, [0., 0.], math.pi / 4))
+        node['observations'].append(dict(stamp_ns=2, camera_pose=[1., 0.], camera_yaw=0.))
+        self.assertFalse(recorder._distinct(node, 3, [1.1, 0.], 0.))
+        memory.max_observations = 2
+        self.assertFalse(recorder._distinct(node, 3, [5., 0.], math.pi))
 
 
 class FrontierAttachmentTest(unittest.TestCase):

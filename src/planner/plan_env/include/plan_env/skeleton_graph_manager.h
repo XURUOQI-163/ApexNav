@@ -1,9 +1,11 @@
 #pragma once
 #include <plan_env/skeleton_graph.h>
 #include <plan_env/skeleton_frontier_links.h>
+#include <plan_env/skeleton_route.h>
 #include <plan_env/msg/skeleton_graph.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <visualization_msgs/msg/marker_array.hpp>
+#include <nav_msgs/msg/odometry.hpp>
 #include <future>
 
 namespace apexnav_planner {
@@ -15,6 +17,8 @@ class SkeletonGraphManager {
 public:
   SkeletonGraphManager(const rclcpp::Node::SharedPtr& node,SDFMap2D* map,const std::string& frame);
   ~SkeletonGraphManager();
+  // Call from the default mutually-exclusive map/planner callback group only.
+  skeleton::Route routeToFrontier(cv::Point2d start,cv::Point2d frontier,double radius) const;
 private:
   struct Result {
     skeleton::Graph graph;skeleton::Fingerprint fingerprint;
@@ -24,6 +28,7 @@ private:
     double build_ms,link_ms;
   };
   void tick();
+  void odometryCallback(const nav_msgs::msg::Odometry::SharedPtr msg);
   skeleton::GridInput sample() const;
   std::vector<skeleton::Frontier> sampleFrontiers() const;
   bool validateLinks(const std::vector<skeleton::Frontier>& current);
@@ -42,6 +47,10 @@ private:
   double link_ms_=0;
   std::future<Result> job_;
   rclcpp::TimerBase::SharedPtr timer_;
+  rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_sub_;
+  cv::Point2d robot_position_;
+  int64_t robot_stamp_ns_=0,created_at_ns_=0;
+  double odom_timeout_=1.;
   rclcpp::Publisher<plan_env::msg::SkeletonGraph>::SharedPtr graph_pub_;
   rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr markers_pub_;
   uint64_t revision_=0;

@@ -49,7 +49,9 @@ def generate_launch_description():
         parameters=[
             planning_param_file,
             os.path.join(exploration_manager_share, 'config', 'skeleton_graph.yaml'),
+            os.path.join(exploration_manager_share, 'config', 'skeleton_route.yaml'),
             {
+                'global_path_planner': ParameterValue(LaunchConfiguration('global_path', default='GRID'), value_type=str),
                 'skeleton_graph.enabled': ParameterValue(LaunchConfiguration('skeleton', default='false'), value_type=bool),
                 # FSM mode selection
                 'is_real_world': LaunchConfiguration('is_real_world_'),

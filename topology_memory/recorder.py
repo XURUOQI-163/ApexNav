@@ -1,9 +1,11 @@
 """ROS message adapters and bounded keyframe selection, run only on disk worker."""
 from collections import OrderedDict
 from copy import deepcopy
+from types import SimpleNamespace
 import math
 
 from basic_utils.frontier_frame_window import Frame, FrameWindow, project_cells
+from .keyframe_policy import select_keyframe, junction_capture_allowed, distance_to_node, view_error
 
 
 def stamp(header):
@@ -30,6 +32,14 @@ def skeleton_data(msg):
                   anchor_pixels=[list(p) for p in zip(n.anchor_pixel_x, n.anchor_pixel_y)],
                   clearance=n.clearance, near_unknown_boundary=n.near_unknown_boundary)
              for n in msg.nodes if n.active]
+    by_id = {int(n.node_id): n for n in msg.nodes}
+    for node in nodes:
+        if node['node_type'] == 'JUNCTION':
+            source = by_id[node['source_id']]
+            node.update(visit_state='CONFIRMED' if source.visit_state == source.CONFIRMED else 'CANDIDATE',
+                        visit_radius=source.visit_radius if source.visit_radius > 0 else .5,
+                        confirmed_at_ns=int(source.confirmed_at_ns),
+                        visit_position=xy(source.visit_position) if source.confirmed_at_ns > 0 else None)
     edges = [dict(source_id=int(e.edge_id), start_source_id=int(e.start_node_id),
                   end_source_id=int(e.end_node_id), path=[xy(p) for p in e.path],
                   pixel_path=[list(p) for p in zip(e.pixel_x, e.pixel_y)],
@@ -40,21 +50,20 @@ def skeleton_data(msg):
                               height=msg.map_info.height, origin=pose(msg.map_info.origin)))
 
 
-def frontier_data(state, graph, context, score_metadata):
+def frontier_data(state, graph, context, score_metadata, include_cells=True):
     links = {int(link.frontier_id): link for link in graph.frontier_links}
     result = []
     for node in state.nodes:
-        cells = [dict(token=int(c.token), pixel=[c.pixel_x, c.pixel_y], x=c.x, y=c.y,
-                      fused_score=c.fused_score if c.confidence > 0 else None,
-                      confidence=c.confidence, raw_similarity=c.raw_similarity if c.confidence > 0 else None,
-                      last_frame_stamp_ns=int(c.last_frame_stamp_ns)) for c in node.cells]
-        scored = [c for c in cells if c['confidence'] > 0]
-        winner = max(scored, key=lambda c: c['fused_score']) if scored else None
-        raw_stamp = winner['last_frame_stamp_ns'] if winner else None
+        winner = max((c for c in node.cells if c.confidence > 0),
+                     key=lambda c: c.fused_score, default=None)
+        raw_stamp = int(winner.last_frame_stamp_ns) if winner else None
+        # Cell geometry is temporary input for opt-in image selection only.
+        cells = [dict(token=int(c.token), pixel=[c.pixel_x, c.pixel_y])
+                 for c in node.cells] if include_cells else []
         metadata = score_metadata.get(raw_stamp)
         semantic = dict(goal_text=context['goal_text'], model_name=state.backend or context['model_name'],
                         model_version=metadata.model_version or None if metadata else None,
-                        raw_similarity=winner['raw_similarity'] if winner else None,
+                        raw_similarity=winner.raw_similarity if winner else None,
                         raw_frame_stamp_ns=raw_stamp,
                         computed_at=int(metadata.computed_at_ns) if metadata else None,
                         fused_score=node.fused_score if node.scored_cells else None,
@@ -94,11 +103,12 @@ def frontier_data(state, graph, context, score_metadata):
 
 class MemoryRecorder:
     def __init__(self, memory, cv_bridge, window_size=20, keyframe_angle_degrees=45.,
-                 keyframe_distance=.75, jpeg_quality=90, model_version=''):
+                 keyframe_distance=.75, jpeg_quality=90, model_version='', junction_keyframe_angle_degrees=60.):
         self.memory = memory
         self.cv = cv_bridge
         self.capacity = int(window_size)
         self.angle = math.radians(keyframe_angle_degrees)
+        self.junction_angle = math.radians(junction_keyframe_angle_degrees)
         self.distance = keyframe_distance
         self.quality = int(jpeg_quality)
         self.model_version = model_version
@@ -127,7 +137,7 @@ class MemoryRecorder:
             acquired = stamp(rgb.header)
             if (acquired <= cutoff or acquired in self.window.frames or
                     acquired != stamp(scan.header) or acquired != stamp(odom.header) or
-                    scan.header.frame_id != context['frame_id'] or scan.resolution <= 0 or
+                    scan.header.frame_id != context['frame_id'] or odom.header.frame_id != context['frame_id'] or scan.resolution <= 0 or
                     len(scan.free_x) != len(scan.free_y)):
                 continue
             q = scan.camera_pose.orientation
@@ -144,6 +154,12 @@ class MemoryRecorder:
                     stamp(observation.image.header) != acquired or
                     len(observation.cell_ids) != len(observation.weights)):
                 continue
+            if not self.memory.save_frontier_images:
+                # Keep score provenance without retaining its RGB payload.
+                self.scored[acquired] = SimpleNamespace(model_version=observation.model_version,
+                                                       computed_at_ns=observation.computed_at_ns)
+                self.scored.move_to_end(acquired)
+                continue
             if acquired in self.scored:
                 previous = self.scored[acquired]
                 evidence = dict(zip(previous.cell_ids, previous.weights))
@@ -156,20 +172,20 @@ class MemoryRecorder:
         while len(self.scored) > self.capacity:
             self.scored.popitem(last=False)
         self.memory.save_skeleton_graph(skeleton_data(graph))
-        current = frontier_data(state, graph, context, self.scored)
+        current = frontier_data(state, graph, context, self.scored, self.memory.save_frontier_images)
         if self.model_version:
             for node in current:
                 node['semantic']['model_version'] = self.model_version
         self.memory.save_frontier_state(current)
-        self._select_observations()
+        self._select_observations({n['source_id']: n['cells'] for n in current})
         self.memory.flush()
         return True
 
     def _distinct(self, node, acquired, camera, yaw):
-        existing = node['observations']
+        existing = node.get('observations', [])
         if any(o['stamp_ns'] == acquired for o in existing):
             return False
-        if len(existing) >= self.memory.max_observations:
+        if len(existing) >= self.memory.observation_limit(node):
             return False
         # Require meaningful new viewpoint/heading relative to EVERY saved view.
         return all(angle_distance(yaw, o['camera_yaw']) >= self.angle or
@@ -177,14 +193,26 @@ class MemoryRecorder:
                    for o in existing)
 
     def _save(self, node, acquired, image, camera, robot, yaw, **extra):
+        if self.memory.observation_limit(node) == 0:
+            return
         evidence = extra.get('evidence')
         if evidence and self.memory.enrich_observation(node['node_id'], acquired, evidence):
             return
-        distinct = self._distinct(node, acquired, camera, yaw)
         replace_id = None
+        if node['node_type'] in ('JUNCTION', 'ENDPOINT'):
+            accepted, replace_id = select_keyframe(node, acquired, camera, robot, yaw,
+                                                  self.memory.observation_limit(node), self.junction_angle)
+            if not accepted:
+                return
+            distinct = True
+            extra.update(capture_policy='junction_visit_v1' if node['node_type'] == 'JUNCTION' else 'deadend_alignment_v1',
+                         node_distance=distance_to_node(node, robot if node['node_type'] == 'JUNCTION' else camera),
+                         view_angle_error=view_error(node, camera, yaw))
+        else:
+            distinct = self._distinct(node, acquired, camera, yaw)
         if not distinct and evidence:
-            # Upgrade an unscored representative at the same viewpoint. Retain
-            # its JPEG; the newly selected original gets a unique ID.
+            # Upgrade an unscored representative at the same viewpoint, keeping
+            # no stale reference; the old JPEG is collected after the next flush.
             equivalent = [o for o in node['observations'] if not o.get('evidence') and
                           angle_distance(yaw, o['camera_yaw']) < self.angle and
                           math.hypot(camera[0]-o['camera_pose'][0], camera[1]-o['camera_pose'][1]) < self.distance]
@@ -202,10 +230,11 @@ class MemoryRecorder:
                                           camera_yaw=yaw, bearing_to_node=math.atan2(node['y']-camera[1], node['x']-camera[0]),
                                           **extra), replace_id=replace_id)
 
-    def _select_observations(self):
+    def _select_observations(self, frontier_cells):
         # Prefer actual scored originals, including pinned frames evicted from live window.
-        for node in self.memory.frontiers:
-            tokens = {c['token'] for c in node['cells']}
+        for node in self.memory.frontiers if self.memory.save_frontier_images else []:
+            members = frontier_cells.get(node['source_id'], [])
+            tokens = {c['token'] for c in members}
             for acquired, observation in reversed(self.scored.items()):
                 supported = [(int(t), float(w)) for t, w in zip(observation.cell_ids, observation.weights) if t in tokens]
                 if supported:
@@ -217,7 +246,7 @@ class MemoryRecorder:
                                              computed_at=int(observation.computed_at_ns),
                                              projected_cells=[dict(token=t, weight=w) for t, w in supported]))
             # An unscored geometry view is still useful; it is explicitly unscored.
-            cells = [(c['token'], *c['pixel']) for c in node['cells']]
+            cells = [(c['token'], *c['pixel']) for c in members]
             for frame in reversed(self.window.snapshot()):
                 if project_cells(frame, cells):
                     self._save(node, frame.stamp, frame.image, frame.camera_pose, frame.robot_pose,
@@ -226,6 +255,12 @@ class MemoryRecorder:
             if node['status'] != 'ACTIVE':
                 continue
             for frame in reversed(self.window.snapshot()):
+                if node['node_type'] == 'JUNCTION':
+                    # Capture the surroundings while the robot is AT this
+                    # junction, including headings looking away from its centre.
+                    if junction_capture_allowed(node, frame.robot_pose):
+                        self._save(node, frame.stamp, frame.image, frame.camera_pose, frame.robot_pose, frame.camera_yaw)
+                    continue
                 ix = math.floor((node['x']-frame.origin_x)/frame.resolution)
                 iy = math.floor((node['y']-frame.origin_y)/frame.resolution)
                 dx, dy = node['x']-frame.camera_x, node['y']-frame.camera_y

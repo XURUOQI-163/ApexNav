@@ -14,3 +14,11 @@ uint32 neighbor_count
 float64 clearance
 bool near_unknown_boundary
 bool active
+# Visit evidence applies only to JUNCTION. ENDPOINT / LOOP_ANCHOR use NOT_APPLICABLE.
+uint8 CANDIDATE=0
+uint8 CONFIRMED=1
+uint8 NOT_APPLICABLE=255
+uint8 visit_state
+float64 visit_radius
+int64 confirmed_at_ns
+geometry_msgs/Point visit_position

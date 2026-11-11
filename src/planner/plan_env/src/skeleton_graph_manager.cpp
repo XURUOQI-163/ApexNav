@@ -31,8 +31,10 @@ SkeletonGraphManager::SkeletonGraphManager(const rclcpp::Node::SharedPtr& node,S
   options_.node_match_distance=param(node,"node_match_distance",.4);
   options_.min_deadend_width=param(node,"min_deadend_width",.2);
   options_.deadend_width_sample_fraction=param(node,"deadend_width_sample_fraction",.5);
-  options_.frontier_deadend_distance=param(node,"frontier_deadend_distance",.2);
   options_.min_island_area=param(node,"min_island_area",1.);
+  options_.junction_merge_length=param(node,"junction_merge_length",.5);
+  options_.visit_radius=param(node,"visit_radius",.5);
+  odom_timeout_=param(node,"visit_odom_timeout",1.);
   options_.remove_deadends=param(node,"remove_deadends",true);
   connect_frontiers_=param(node,"connect_frontiers",true);
   max_association_distance_=param(node,"frontier_max_association_distance",.5);
@@ -42,7 +44,9 @@ SkeletonGraphManager::SkeletonGraphManager(const rclcpp::Node::SharedPtr& node,S
   edge_width_=param(node,"edge_width",.035);label_scale_=param(node,"label_scale",.14);
   labels_=param(node,"show_node_ids",true);
   if(!std::isfinite(hz)||hz<=0||hz>30)throw std::invalid_argument("skeleton_graph.update_hz must be in (0,30]");
-  for(double v:{options_.min_island_area,options_.min_branch_length,options_.min_deadend_width,options_.frontier_deadend_distance,options_.unknown_boundary_distance,options_.node_match_distance})
+  if(!std::isfinite(options_.visit_radius)||options_.visit_radius<=0||!std::isfinite(odom_timeout_)||odom_timeout_<=0)
+    throw std::invalid_argument("Junction visit radius and odometry timeout must be positive");
+  for(double v:{options_.min_island_area,options_.min_branch_length,options_.min_deadend_width,options_.unknown_boundary_distance,options_.node_match_distance,options_.junction_merge_length})
     if(!std::isfinite(v)||v<0)throw std::invalid_argument("skeleton graph distances must be finite and nonnegative");
   if(!std::isfinite(options_.deadend_width_sample_fraction)||options_.deadend_width_sample_fraction<=0||options_.deadend_width_sample_fraction>1)
     throw std::invalid_argument("skeleton_graph.deadend_width_sample_fraction must be in (0,1]");
@@ -54,18 +58,33 @@ SkeletonGraphManager::SkeletonGraphManager(const rclcpp::Node::SharedPtr& node,S
   Eigen::Vector2d origin,size;map_->getRegion(origin,size);double resolution=map_->getResolution();
   graph_.geometry={int(std::ceil(size.x()/resolution)),int(std::ceil(size.y()/resolution)),resolution,origin.x(),origin.y(),0,frame_};
   sampled_at_=node->now();publish(node); // New map episode clears prior latched graph/markers.
+  created_at_ns_=node->now().nanoseconds();
+  odom_sub_=node->create_subscription<nav_msgs::msg::Odometry>("/odom_world",10,
+    [this](nav_msgs::msg::Odometry::SharedPtr msg){odometryCallback(msg);});
   timer_=node->create_wall_timer(std::chrono::duration<double>(1./hz),[this]{tick();});
   RCLCPP_INFO(node->get_logger(),"[Skeleton] enabled: %.2f Hz, %s, read-only SDFMap2D observer",hz,skeleton::thinningBackend());
   RCLCPP_INFO(node->get_logger(),"[Skeleton] leaf pruning: length < %.2fm OR terminal %.0f%% max width < %.2fm; no Unknown exemption",
     options_.min_branch_length,100*options_.deadend_width_sample_fraction,options_.min_deadend_width);
-  RCLCPP_INFO(node->get_logger(),"[Skeleton] isolated segments use full-path width; reachable frontier boundary pruning < %.2fm",
-    options_.frontier_deadend_distance);
+  RCLCPP_INFO(node->get_logger(),"[Skeleton] isolated segments use full-path width; no frontier-proximity pruning");
+  RCLCPP_INFO(node->get_logger(),"[Skeleton] Junction clustering: direct edge length < %.2fm, arithmetic mean position (0 disables)",options_.junction_merge_length);
+  RCLCPP_INFO(node->get_logger(),"[Skeleton] Junction confirmation requires robot odometry within %.2fm",options_.visit_radius);
   RCLCPP_INFO(node->get_logger(),"[Skeleton] discard isolated free regions smaller than %.2fm^2; retain largest component",options_.min_island_area);
 }
 SkeletonGraphManager::~SkeletonGraphManager() {
   if(timer_)timer_->cancel();
   // No worker captures this/map/node; join before releasing the last input.
   if(job_.valid())job_.wait();
+}
+void SkeletonGraphManager::odometryCallback(const nav_msgs::msg::Odometry::SharedPtr msg) {
+  auto node=node_.lock();if(!node||msg->header.frame_id!=frame_)return;
+  int64_t stamp=rclcpp::Time(msg->header.stamp).nanoseconds();
+  double age=(node->now().nanoseconds()-stamp)*1e-9;
+  const auto& p=msg->pose.pose.position;
+  if(stamp<created_at_ns_||stamp<=robot_stamp_ns_||age<0||age>odom_timeout_||!std::isfinite(p.x)||!std::isfinite(p.y))return;
+  robot_stamp_ns_=stamp;robot_position_={p.x,p.y};
+  if(skeleton::confirmVisitedJunctions(graph_,robot_position_,options_.visit_radius,stamp)) {
+    ++revision_;geometry_rebuilt_=false;sampled_at_=msg->header.stamp;publish(node);
+  }
 }
 skeleton::GridInput SkeletonGraphManager::sample() const {
   skeleton::GridInput in;
@@ -85,7 +104,7 @@ skeleton::GridInput SkeletonGraphManager::sample() const {
 }
 std::vector<skeleton::Frontier> SkeletonGraphManager::sampleFrontiers() const {
   std::vector<skeleton::Frontier> out;
-  if((!connect_frontiers_&&options_.frontier_deadend_distance<=0)||!map_->frontier_map2d_)return out;
+  if(!connect_frontiers_||!map_->frontier_map2d_)return out;
   auto append=[&](const auto& list,bool active) {
     for(const auto& f:list) {
       skeleton::Frontier copy;copy.id=f.id_;copy.active=active;copy.centroid={f.average_.x(),f.average_.y()};
@@ -96,6 +115,23 @@ std::vector<skeleton::Frontier> SkeletonGraphManager::sampleFrontiers() const {
   append(map_->frontier_map2d_->activeFrontiers(),true);
   append(map_->frontier_map2d_->dormantFrontiers(),false);
   return out;
+}
+skeleton::Route SkeletonGraphManager::routeToFrontier(cv::Point2d start,cv::Point2d frontier,double radius) const {
+  skeleton::Route failed;failed.reason="FRONTIER_ATTACHMENT_NOT_READY";
+  // Match current members, not only an old ID or centroid from an async snapshot.
+  for(const auto& f:sampleFrontiers())if(cv::norm(f.centroid-frontier)<1e-6) {
+    const auto signature=skeleton::frontierFingerprint({f});
+    for(const auto& link:links_)if(link.frontier_id==f.id&&link.connected&&link.geometry_signature==signature) {
+      auto state=[&](cv::Point p)->uint8_t {
+        Eigen::Vector2i idx(p.x,p.y);int occupancy=map_->getOccupancy(idx);
+        if(occupancy==SDFMap2D::UNKNOWN)return skeleton::UNKNOWN;
+        if(occupancy!=SDFMap2D::FREE)return skeleton::BLOCKED;
+        return map_->getInflateOccupancy(idx)==0?skeleton::FREE:skeleton::INFLATED;
+      };
+      return skeleton::shortestRoute(graph_,start,link,state,radius);
+    }
+  }
+  return failed;
 }
 bool SkeletonGraphManager::validateLinks(const std::vector<skeleton::Frontier>& current) {
   bool changed=skeleton::discardStaleLinks(links_,current);
@@ -129,9 +165,14 @@ void SkeletonGraphManager::tick() {
     if(job_.valid()) {
       if(job_.wait_for(std::chrono::seconds(0))!=std::future_status::ready)return;
       auto result=job_.get();
-      // Accept the timestamped snapshot, then rebuild below if frontier geometry
+      // Accept the timestamped snapshot, then refresh links if frontiers
       // changed during the job. Dropping every changed snapshot would starve
       // publication while the robot is continuously exploring.
+      // Preserve visits received while the worker held an older graph snapshot.
+      skeleton::inheritJunctionVisits(result.graph,graph_,options_.visit_radius);
+      const double age=(node->now().nanoseconds()-robot_stamp_ns_)*1e-9;
+      if(robot_stamp_ns_>0&&age>=0&&age<=odom_timeout_)
+        skeleton::confirmVisitedJunctions(result.graph,robot_position_,options_.visit_radius,robot_stamp_ns_);
       graph_=std::move(result.graph);build_ms_=result.build_ms;link_ms_=result.link_ms;
       geometry_rebuilt_=result.geometry_rebuilt;
       // Link-only refreshes must not forget accumulated small map changes.
@@ -146,12 +187,8 @@ void SkeletonGraphManager::tick() {
     }
     auto start=Clock::now();auto in=sample();auto hashes=skeleton::fingerprint(in,tile_size_);
     auto signature=skeleton::frontierFingerprint(current);
-    const bool frontier_rebuild=options_.frontier_deadend_distance>0&&
-      (signature!=accepted_frontiers_||link_gate_->shouldRebuild(hashes));
     const bool connectivity_changed=options_.min_island_area>0&&link_gate_->shouldRebuild(hashes);
-    bool rebuild=gate_->shouldRebuild(hashes)||frontier_rebuild||connectivity_changed;
-    if(options_.frontier_deadend_distance>0)
-      for(const auto& f:current)in.frontier_cells.insert(in.frontier_cells.end(),f.cells.begin(),f.cells.end());
+    bool rebuild=gate_->shouldRebuild(hashes)||connectivity_changed;
     bool links_changed=connect_frontiers_&&!current.empty()&&link_gate_->shouldRebuild(hashes);
     if(!rebuild&&!links_changed&&signature==accepted_frontiers_)return;
     changed_tiles_=gate_->changedTiles(hashes);sampled_at_=node->now();sampling_ms_=milliseconds(start);
@@ -174,9 +211,15 @@ void SkeletonGraphManager::publish(const rclcpp::Node::SharedPtr& node) {
   for(const auto& n:graph_.nodes) {
     plan_env::msg::SkeletonNode out;out.node_id=n.id;out.node_type=uint8_t(n.type);out.pixel_x=n.pixel.x;out.pixel_y=n.pixel.y;
     out.position=point(n.position);out.neighbor_node_ids=n.neighbors;out.neighbor_count=n.neighbor_count;
-    // Keep the existing wire/storage fields: one actual skeleton location.
+    // Cell containing the node position; a merged arithmetic centre need not be a pixel centre.
     out.anchor_pixel_x.push_back(n.pixel.x);out.anchor_pixel_y.push_back(n.pixel.y);
     out.clearance=n.clearance;out.near_unknown_boundary=n.near_unknown_boundary;out.active=n.active;msg.nodes.push_back(std::move(out));
+    auto& saved=msg.nodes.back();
+    saved.visit_state=n.type==skeleton::NodeType::JUNCTION?uint8_t(n.visit_state):plan_env::msg::SkeletonNode::NOT_APPLICABLE;
+    if(n.type==skeleton::NodeType::JUNCTION) {
+      saved.visit_radius=options_.visit_radius;saved.confirmed_at_ns=n.confirmed_at_ns;
+      saved.visit_position=point(n.visit_position,0);
+    }
   }
   for(const auto& e:graph_.edges) {
     plan_env::msg::SkeletonEdge out;out.edge_id=e.id;out.start_node_id=e.start;out.end_node_id=e.end;out.length=e.length;out.min_clearance=e.min_clearance;
@@ -207,12 +250,14 @@ void SkeletonGraphManager::publish(const rclcpp::Node::SharedPtr& node) {
   for(const auto& e:graph_.edges)for(size_t i=1;i<e.display_path.size();++i){edges.points.push_back(point(e.display_path[i-1],z_));edges.points.push_back(point(e.display_path[i],z_));}
   markers.markers.push_back(std::move(edges));
   auto endpoints=marker("endpoints",Marker::SPHERE_LIST,1,0,0);
-  auto junctions=marker("junctions",Marker::SPHERE_LIST,0,1,0);
+  auto junctions=marker("junctions",Marker::SPHERE_LIST,.60,1,.60);
+  auto confirmed=marker("junctions_confirmed",Marker::SPHERE_LIST,0,.40,.08);
   auto loops=marker("loop_anchors",Marker::SPHERE_LIST,.65,0,1);
-  for(auto* m:{&endpoints,&junctions,&loops})m->scale.x=m->scale.y=m->scale.z=node_scale_;
+  for(auto* m:{&endpoints,&junctions,&confirmed,&loops})m->scale.x=m->scale.y=m->scale.z=node_scale_;
   int label_id=0;
   for(const auto& n:graph_.nodes) {
     auto* m=n.type==skeleton::NodeType::ENDPOINT?&endpoints:n.type==skeleton::NodeType::JUNCTION?&junctions:&loops;
+    if(n.type==skeleton::NodeType::JUNCTION&&n.visit_state==skeleton::VisitState::CONFIRMED)m=&confirmed;
     m->points.push_back(point(n.position,z_));
     if(labels_) {
       auto text=marker("node_ids",Marker::TEXT_VIEW_FACING,.15,.15,.15);text.id=label_id++;
@@ -221,6 +266,7 @@ void SkeletonGraphManager::publish(const rclcpp::Node::SharedPtr& node) {
     }
   }
   markers.markers.push_back(std::move(endpoints));markers.markers.push_back(std::move(junctions));markers.markers.push_back(std::move(loops));
+  markers.markers.push_back(std::move(confirmed));
   auto connections=marker("frontier_links",Marker::LINE_LIST,0,.75,1);connections.scale.x=edge_width_;
   auto associations=marker("frontier_associations",Marker::LINE_LIST,1,.55,0);associations.scale.x=edge_width_;
   int frontier_label=0;

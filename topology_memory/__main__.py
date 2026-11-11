@@ -9,10 +9,11 @@ from .store import UnifiedTopologyMemory
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--directory', default=str(Path(__file__).resolve().parents[1] / 'data/topology'))
+    parser.add_argument('--frontier-images', action='store_true', help='Include opt-in Frontier image observations')
     parser.add_argument('--node', help='List one node\'s original RGB observations')
     parser.add_argument('--export', action='store_true', help='Rebuild the derived combined snapshot (stop recorder first)')
     args = parser.parse_args()
-    memory = UnifiedTopologyMemory(args.directory)
+    memory = UnifiedTopologyMemory(args.directory, save_frontier_images=args.frontier_images)
     issues = memory.load_memory()
     if args.node:
         result = memory.get_node_observations(args.node)

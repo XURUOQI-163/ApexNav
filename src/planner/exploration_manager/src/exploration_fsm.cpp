@@ -276,7 +276,7 @@ int ExplorationFSM::callActionPlanner()
 
   /*******  Decide whether to replan path (stability heuristic) START *******/
   // Use path stability to reduce oscillation between different frontier targets
-  vector<Vector2d> last_next_best_path = expl_manager_->ed_->next_best_path_;
+  vector<Vector2d> last_next_best_path = expl_manager_->selectedGridPath();
   Vector2d last_next_pos = expl_manager_->ed_->next_pos_;
   if (fd_->dormant_frontier_flag_) {
     fd_->replan_flag_ = true;
@@ -296,6 +296,8 @@ int ExplorationFSM::callActionPlanner()
     fd_->replan_flag_ = true;
   }
   /*******  Decide whether to replan path (stability heuristic) END *******/
+  if(expl_res == EXPL_RESULT::EXPLORATION)
+    expl_manager_->applySelectedSkeletonPath(current_pos);
 
   // Publish exploration result to monitor
   std_msgs::msg::Int32 expl_result_msg;

@@ -31,43 +31,6 @@ void validate(const GridInput& in) {
      g.frame_id.empty()||in.cells.type()!=CV_8UC1||in.cells.cols!=g.width||in.cells.rows!=g.height)
     throw std::invalid_argument("invalid skeleton map geometry/image");
 }
-// Bounded multi-source Dijkstra in known, non-inflated free cells. A source
-// lies at the shared face of an actual UNKNOWN frontier cell and a FREE cell:
-// the first free-cell centre is half a cell from that face. No Unknown cell
-// is traversed, and diagonal steps require both orthogonal neighbours free.
-cv::Mat frontierDistances(const GridInput& in,const cv::Mat& free,cv::Point offset,double limit) {
-  cv::Mat distance(free.size(),CV_64F,cv::Scalar(std::numeric_limits<double>::infinity()));
-  if(limit<=0||in.frontier_cells.empty())return distance;
-  auto allowed=[&](cv::Point p){return p.x>=0&&p.y>=0&&p.x<free.cols&&p.y<free.rows&&free.at<uint8_t>(p)!=0;};
-  using Item=std::tuple<double,int,int>;
-  std::priority_queue<Item,std::vector<Item>,std::greater<Item>> queue;
-  const double seed_distance=.5*in.geometry.resolution;
-  const cv::Point faces[]={{1,0},{-1,0},{0,1},{0,-1}};
-  for(auto world_pixel:in.frontier_cells) {
-    if(world_pixel.x<0||world_pixel.y<0||world_pixel.x>=in.cells.cols||world_pixel.y>=in.cells.rows||
-       in.cells.at<uint8_t>(world_pixel)!=UNKNOWN)continue;
-    for(cv::Point step:faces) {
-      auto p=world_pixel-offset+step;
-      if(allowed(p)&&seed_distance<limit&&seed_distance<distance.at<double>(p)) {
-        distance.at<double>(p)=seed_distance;queue.emplace(seed_distance,p.x,p.y);
-      }
-    }
-  }
-  while(!queue.empty()) {
-    auto [d,x,y]=queue.top();queue.pop();cv::Point p(x,y);
-    if(d>distance.at<double>(p))continue;
-    for(int dy=-1;dy<=1;++dy)for(int dx=-1;dx<=1;++dx) {
-      if(!(dx||dy))continue;
-      auto q=p+cv::Point(dx,dy);if(!allowed(q))continue;
-      if(dx&&dy&&(!allowed(p+cv::Point(dx,0))||!allowed(p+cv::Point(0,dy))))continue;
-      double next=d+std::hypot(dx,dy)*in.geometry.resolution;
-      if(next<limit&&next<distance.at<double>(q)) {
-        distance.at<double>(q)=next;queue.emplace(next,q.x,q.y);
-      }
-    }
-  }
-  return distance;
-}
 cv::Mat thin(const cv::Mat& binary) {
   cv::Mat s;
 #ifdef APEXNAV_HAVE_XIMGPROC
@@ -253,6 +216,70 @@ Traced trace(const cv::Mat& s,const cv::Mat& clearance,const cv::Mat& unknown_di
   }
   return r;
 }
+// Contract connected groups using ORIGINAL edge lengths, then average each
+// original Junction once. No Euclidean-radius or cluster-size rule.
+void mergeShortJunctions(Graph& g,double threshold,const cv::Mat& clearance,
+                         const cv::Mat& unknown_distance,cv::Point offset,double unknown_limit) {
+  if(threshold<=0)return;
+  std::map<uint64_t,uint64_t> parent;
+  for(const auto& n:g.nodes)if(n.type==NodeType::JUNCTION)parent[n.id]=n.id;
+  auto root=[&](uint64_t id){while(parent.at(id)!=id)id=parent.at(id);return id;};
+  bool changed=false;
+  for(const auto& e:g.edges)if(e.start!=e.end&&e.length<threshold&&parent.count(e.start)&&parent.count(e.end)) {
+    auto a=root(e.start),b=root(e.end);if(a!=b){parent[std::max(a,b)]=std::min(a,b);changed=true;}
+  }
+  if(!changed)return;
+  std::map<uint64_t,std::vector<Node>> groups;
+  for(const auto& n:g.nodes)groups[parent.count(n.id)?root(n.id):n.id].push_back(n);
+  const auto& geo=g.geometry;
+  auto cell=[&](cv::Point2d p) {
+    p-=cv::Point2d(geo.origin_x,geo.origin_y);
+    return cv::Point(int(std::floor((std::cos(geo.yaw)*p.x+std::sin(geo.yaw)*p.y)/geo.resolution)),
+                     int(std::floor((-std::sin(geo.yaw)*p.x+std::cos(geo.yaw)*p.y)/geo.resolution)));
+  };
+  auto sample=[&](const cv::Mat& m,cv::Point p) {
+    p-=offset;return p.x>=0&&p.y>=0&&p.x<m.cols&&p.y<m.rows?double(m.at<float>(p)):0.;
+  };
+  std::map<uint64_t,Node> merged;
+  for(const auto& [id,members]:groups) {
+    Node n=members.front();n.id=id;
+    if(members.size()>1) {
+      n.position={0,0};for(const auto& member:members)n.position+=member.position;
+      n.position*=1./members.size();n.pixel=cell(n.position);
+      n.clearance=sample(clearance,n.pixel);
+      n.near_unknown_boundary=sample(unknown_distance,n.pixel)*geo.resolution<=unknown_limit;
+    }
+    merged[id]=std::move(n);
+  }
+  std::vector<Edge> edges;
+  for(auto e:g.edges) {
+    auto a=parent.count(e.start)?root(e.start):e.start,b=parent.count(e.end)?root(e.end):e.end;
+    // Remove contracted short links, retaining pre-existing loops and longer
+    // alternative routes even if their endpoints now belong to the same group.
+    if(e.start!=e.end&&a==b&&e.length<threshold)continue;
+    auto start=merged.at(a).position,end=merged.at(b).position;
+    e.start=a;e.end=b;
+    if(cv::norm(start-e.path.front())>1e-9||cv::norm(end-e.path.back())>1e-9) {
+      auto original=std::move(e.path);e.path.clear();e.pixels.clear();e.length=0;
+      auto append=[&](cv::Point2d p) {
+        if(!e.path.empty()) {double d=cv::norm(p-e.path.back());if(d<1e-9)return;e.length+=d;}
+        e.path.push_back(p);e.pixels.push_back(cell(p));
+        e.min_clearance=std::min(e.min_clearance,sample(clearance,cell(p)));
+      };
+      auto connector=[&](cv::Point2d from,cv::Point2d to) {
+        int steps=std::max(1,int(std::ceil(cv::norm(to-from)/(geo.resolution*.5))));
+        for(int i=1;i<=steps;++i)append(from+(double(i)/steps)*(to-from));
+      };
+      append(start);connector(start,original.front());
+      for(auto p:original)append(p);
+      connector(original.back(),end);
+      e.display_path=e.path;
+    }
+    edges.push_back(std::move(e));
+  }
+  g.nodes.clear();for(auto& [id,n]:merged)g.nodes.push_back(std::move(n));
+  g.edges=std::move(edges);
+}
 void match(Graph& g,const Graph& old,double distance) {
   bool same_frame=g.geometry.frame_id==old.geometry.frame_id;
   g.next_node_id=old.next_node_id;g.next_edge_id=old.next_edge_id;
@@ -295,9 +322,31 @@ const char* thinningBackend() {
   return "builtin_zhang_suen";
 #endif
 }
+bool confirmVisitedJunctions(Graph& graph,cv::Point2d robot,double radius,int64_t stamp_ns) {
+  if(!std::isfinite(robot.x)||!std::isfinite(robot.y)||stamp_ns<=0)return false;
+  bool changed=false;
+  for(auto& n:graph.nodes)if(n.active&&n.type==NodeType::JUNCTION&&n.visit_state==VisitState::CANDIDATE&&
+                            cv::norm(n.position-robot)<=radius) {
+    n.visit_state=VisitState::CONFIRMED;n.confirmed_at_ns=stamp_ns;n.visit_position=robot;changed=true;
+  }
+  return changed;
+}
+void inheritJunctionVisits(Graph& graph,const Graph& previous,double radius) {
+  std::map<uint64_t,const Node*> old;
+  for(const auto& n:previous.nodes)if(n.type==NodeType::JUNCTION)old[n.id]=&n;
+  for(auto& n:graph.nodes)if(n.type==NodeType::JUNCTION) {
+    n.visit_state=VisitState::CANDIDATE;n.confirmed_at_ns=0;n.visit_position={};
+    auto found=old.find(n.id);if(found==old.end())continue;
+    const auto& p=*found->second;
+    if(p.visit_state==VisitState::CONFIRMED&&p.confirmed_at_ns>0&&cv::norm(n.position-p.visit_position)<=radius) {
+      n.visit_state=p.visit_state;n.confirmed_at_ns=p.confirmed_at_ns;n.visit_position=p.visit_position;
+    }
+  }
+}
 Graph build(const GridInput& in,const Options& options,const Graph& previous) {
+  if(!std::isfinite(options.visit_radius)||options.visit_radius<=0)throw std::invalid_argument("invalid Junction visit radius");
   validate(in);
-  for(double v:{options.min_island_area,options.min_branch_length,options.min_deadend_width,options.frontier_deadend_distance,options.unknown_boundary_distance,options.node_match_distance})
+  for(double v:{options.min_island_area,options.min_branch_length,options.min_deadend_width,options.unknown_boundary_distance,options.node_match_distance,options.junction_merge_length})
     if(!std::isfinite(v)||v<0)throw std::invalid_argument("invalid skeleton distance parameter");
   if(!std::isfinite(options.deadend_width_sample_fraction)||options.deadend_width_sample_fraction<=0||options.deadend_width_sample_fraction>1)
     throw std::invalid_argument("invalid deadend width sample fraction");
@@ -339,7 +388,6 @@ Graph build(const GridInput& in,const Options& options,const Graph& previous) {
   cv::max(clearance,0,clearance);
   cv::distanceTransform(known,unknown_distance,cv::DIST_L2,cv::DIST_MASK_PRECISE);
   cv::Mat s=thin(binary);cv::Point offset=box.tl()-cv::Point(1,1);
-  const auto frontier_distance=frontierDistances(in,binary,offset,options.frontier_deadend_distance);
   uint32_t pruned=0;
   while(true) {
     auto result=trace(s,clearance,unknown_distance,in.geometry,offset,options);
@@ -368,12 +416,7 @@ Graph build(const GridInput& in,const Options& options,const Graph& previous) {
       }
       const bool short_branch=e.length<options.min_branch_length;
       const bool narrow_branch=sampled&&options.min_deadend_width>0&&max_width<options.min_deadend_width;
-      auto near_frontier=[&](const Node& node) {
-        return node.type==NodeType::ENDPOINT&&options.frontier_deadend_distance>0&&
-          frontier_distance.at<double>(node.pixel-offset)<options.frontier_deadend_distance-1e-9;
-      };
-      const bool frontier_branch=near_frontier(a)||near_frontier(b);
-      if(!short_branch&&!narrow_branch&&!frontier_branch)continue;
+      if(!short_branch&&!narrow_branch)continue;
       ++pruned;
       for(auto p:e.pixels){p-=offset;int idx=p.y*s.cols+p.x;
         if(!result.owner.count(idx)||result.owner.at(idx)!=junction)remove.insert(idx);}
@@ -391,7 +434,9 @@ Graph build(const GridInput& in,const Options& options,const Graph& previous) {
         g.edges.erase(std::remove_if(g.edges.begin(),g.edges.end(),[&](const Edge& e){return removed.count(e.start)||removed.count(e.end);}),g.edges.end());
         g.removed_deadends=removed.size();
       }
-      match(g,previous,options.node_match_distance);return g;
+      mergeShortJunctions(g,options.junction_merge_length,clearance,unknown_distance,offset,options.unknown_boundary_distance);
+      match(g,previous,options.node_match_distance);
+      inheritJunctionVisits(g,previous,options.visit_radius);return g;
     }
     for(int idx:remove)s.at<uint8_t>(pixel(idx,s.cols))=0;
   }
